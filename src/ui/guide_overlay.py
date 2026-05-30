@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import os
+import math
 from dataclasses import dataclass
+from pathlib import Path
 from datetime import datetime
 from typing import Any
 
 import pygame
+
+from ui.page_text import page_title
 
 # Xbox 360 Metro Guide (2011) — from reference UI
 _C_DIM = (0, 0, 0, 165)
@@ -122,9 +125,18 @@ def _vertical_text(font: pygame.font.Font, text: str, color: pygame.Color) -> py
 class GuideOverlay:
     """Xbox 360 Metro Guide — centered popup, side tabs, green list selection."""
 
-    def __init__(self, theme: dict[str, Any], profile_name: str | None = None) -> None:
+    def __init__(
+        self,
+        theme: dict[str, Any],
+        gamertag: str | None = None,
+        gamerpic_path: str | Path | None = None,
+    ) -> None:
         self.theme = theme
-        self.profile_name = profile_name or os.environ.get("USERNAME", "Player1")
+        self.gamertag = (gamertag or "Player1").strip() or "Player1"
+        self._gamerpic_path: Path | None = None
+        self._gamerpic_surface: pygame.Surface | None = None
+        if gamerpic_path:
+            self.set_gamerpic_path(gamerpic_path)
         self.open = False
         self.transition_progress = 0.0
         self.transition_target = 0.0
@@ -140,6 +152,33 @@ class GuideOverlay:
     @property
     def visible(self) -> bool:
         return self.open or self.transition_progress > 0.0
+
+    def set_profile(self, gamertag: str, gamerpic_path: str | Path | None = None) -> None:
+        self.gamertag = (gamertag or "Player1").strip() or "Player1"
+        self.set_gamerpic_path(gamerpic_path)
+
+    def set_gamerpic_path(self, path: str | Path | None) -> None:
+        self._gamerpic_path = Path(path) if path else None
+        self._gamerpic_surface = None
+
+    def _player_tab_label(self) -> str:
+        name = (self.gamertag or "Player1").strip() or "Player1"
+        return name[:15] if len(name) > 15 else name
+
+    def _tab_label(self, section_index: int) -> str:
+        if GUIDE_SECTIONS[section_index].tab_id == "player":
+            return self._player_tab_label()
+        return page_title(GUIDE_SECTIONS[section_index].label)
+
+    def _gamerpic_image(self) -> pygame.Surface | None:
+        if self._gamerpic_path is None or not self._gamerpic_path.is_file():
+            return None
+        if self._gamerpic_surface is None:
+            try:
+                self._gamerpic_surface = pygame.image.load(str(self._gamerpic_path)).convert_alpha()
+            except (pygame.error, FileNotFoundError):
+                self._gamerpic_surface = None
+        return self._gamerpic_surface
 
     def toggle(self) -> None:
         if self.open:
@@ -237,14 +276,14 @@ class GuideOverlay:
 
     def _metrics(self, screen_w: int, screen_h: int, mix: float) -> dict[str, Any]:
         cfg = self._guide_config()
-        ui = self._ui_scale(screen_w, screen_h)
+        ui = self._ui_scale(screen_w, screen_h) * float(cfg.get("panel_scale", 1.0))
         anim = 0.9 + 0.1 * mix
 
         def scaled(key: str, default: int | float) -> int:
             return max(1, int(float(cfg.get(key, default)) * ui))
 
         panel_w = int(scaled("panel_width", 1480) * anim)
-        panel_h = int(scaled("panel_height", 590) * anim)
+        panel_h = int(scaled("panel_height", 720) * anim)
         panel_w = min(panel_w, screen_w - scaled("screen_margin_x", 24))
         panel_h = min(panel_h, screen_h - scaled("screen_margin_y", 80))
         return {
@@ -266,6 +305,9 @@ class GuideOverlay:
             "pad": scaled("content_pad", 14),
             "row_pad": scaled("row_pad", 3),
             "ring_inset": scaled("header_ring_inset", 100),
+            "orb_half": scaled("orb_half_size", 26),
+            "orb_glow_pad": scaled("orb_glow_pad", 12),
+            "header_content_gap": scaled("header_content_gap", 18),
         }
 
     def _layout(self, screen_w: int, screen_h: int, mix: float) -> dict[str, Any]:
@@ -275,15 +317,16 @@ class GuideOverlay:
         block_x = (screen_w - block_w) // 2
         block_y = (screen_h - block_h) // 2 - m["offset_y"]
         header_h = m["header_h"]
+        header_gap = m["header_content_gap"]
         tab_w = m["tab_w"]
-        body_h = block_h - header_h
+        body_h = block_h - header_h - header_gap
         left_tabs = [i for i, s in enumerate(GUIDE_SECTIONS) if s.side == "left"]
         right_tabs = [i for i, s in enumerate(GUIDE_SECTIONS) if s.side == "right"]
         left_w = tab_w * len(left_tabs)
         right_w = tab_w * len(right_tabs)
         content_x = block_x + left_w
         content_w = block_w - left_w - right_w
-        content_y = block_y + header_h
+        content_y = block_y + header_h + header_gap
         content_rect = pygame.Rect(content_x, content_y, content_w, body_h)
         tab_rects: list[pygame.Rect] = []
         x = block_x
@@ -305,45 +348,85 @@ class GuideOverlay:
             "metrics": m,
         }
 
-    @staticmethod
-    def _draw_xbox_orb(screen: pygame.Surface, center: tuple[int, int], ui_scale: float) -> None:
-        cx, cy = center
-        glow_r = max(18, int(22 * ui_scale))
-        orb_r = max(10, int(13 * ui_scale))
-        glow_size = glow_r * 2 + 4
-        glow = pygame.Surface((glow_size, glow_size), pygame.SRCALPHA)
-        pygame.draw.circle(glow, (120, 210, 70, 90), (glow_size // 2, glow_size // 2), glow_r)
-        screen.blit(glow, (cx - glow_size // 2, cy - glow_size // 2))
-        pygame.draw.circle(screen, pygame.Color(245, 248, 250), (cx, cy), orb_r)
-        pygame.draw.circle(screen, pygame.Color(88, 168, 42), (cx, cy), orb_r, max(1, int(2 * ui_scale)))
-        arc_box = orb_r + max(4, int(5 * ui_scale))
-        lw = max(1, int(2 * ui_scale))
-        pygame.draw.arc(
-            screen,
-            pygame.Color(72, 150, 36),
-            (cx - arc_box, cy - arc_box, arc_box * 2, arc_box * 2),
-            0.5,
-            2.6,
-            lw,
-        )
-        pygame.draw.arc(
-            screen,
-            pygame.Color(72, 150, 36),
-            (cx - arc_box, cy - arc_box, arc_box * 2, arc_box * 2),
-            3.6,
-            5.8,
-            lw,
-        )
+    def _draw_header_emblem(
+        self,
+        screen: pygame.Surface,
+        center: tuple[int, int],
+        ui_scale: float,
+        orb_half: int,
+        orb_glow_pad: int,
+    ) -> None:
+        pic = self._gamerpic_image()
+        if pic is not None:
+            self._draw_gamerpic_emblem(screen, center, ui_scale, orb_half, orb_glow_pad, pic)
+            return
+        self._draw_xbox_orb(screen, center, ui_scale, orb_half, orb_glow_pad)
 
     @staticmethod
-    def _draw_player_ring(screen: pygame.Surface, center: tuple[int, int], ui_scale: float) -> None:
+    def _draw_gamerpic_emblem(
+        screen: pygame.Surface,
+        center: tuple[int, int],
+        ui_scale: float,
+        orb_half: int,
+        orb_glow_pad: int,
+        image: pygame.Surface,
+    ) -> None:
         cx, cy = center
-        colors = [(255, 220, 70), (240, 240, 240), (90, 190, 255), (90, 210, 100)]
+        half = orb_half + orb_glow_pad // 2
+        emblem = pygame.Rect(cx - half, cy - half, half * 2, half * 2)
+        scaled = pygame.transform.smoothscale(image, emblem.size)
+        screen.blit(scaled, emblem.topleft)
+
+    @staticmethod
+    def _draw_xbox_orb(
+        screen: pygame.Surface,
+        center: tuple[int, int],
+        ui_scale: float,
+        orb_half: int,
+        orb_glow_pad: int,
+    ) -> None:
+        cx, cy = center
+        half = orb_half
+        glow_pad = orb_glow_pad
+        emblem = pygame.Rect(cx - half, cy - half, half * 2, half * 2)
+        glow_rect = emblem.inflate(glow_pad, glow_pad)
+        glow = pygame.Surface(glow_rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(glow, (100, 200, 60, 110), glow.get_rect())
+        screen.blit(glow, glow_rect.topleft)
+        pygame.draw.rect(screen, pygame.Color(245, 248, 250), emblem)
+        border = max(2, int(3 * ui_scale))
+        pygame.draw.rect(screen, pygame.Color(88, 168, 42), emblem, border)
+        arc_inset = max(5, int(7 * ui_scale))
+        arc_rect = emblem.inflate(-arc_inset, -arc_inset)
+        lw = max(2, int(3 * ui_scale))
+        pygame.draw.arc(screen, pygame.Color(72, 150, 36), arc_rect, 0.5, 2.6, lw)
+        pygame.draw.arc(screen, pygame.Color(72, 150, 36), arc_rect, 3.6, 5.8, lw)
+
+    @staticmethod
+    def _draw_player_ring(
+        screen: pygame.Surface,
+        center: tuple[int, int],
+        ui_scale: float,
+        active_color: pygame.Color,
+    ) -> None:
+        """Ring of light: four arc chunks on a circle at diagonal corners; top-left = player 1."""
+        cx, cy = center
         r = max(8, int(11 * ui_scale))
         lw = max(2, int(3 * ui_scale))
-        for i, col in enumerate(colors):
-            start = i * 1.57
-            pygame.draw.arc(screen, pygame.Color(*col), (cx - r, cy - r, r * 2, r * 2), start, start + 1.2, lw)
+        idle = pygame.Color(128, 136, 144)
+        chunk = 1.12
+        # Chunk centers: top-left, top-right, bottom-left, bottom-right (pygame arc angles)
+        chunks: tuple[tuple[float, bool], ...] = (
+            (3 * math.pi / 4, True),  # top-left (player 1)
+            (math.pi / 4, False),  # top-right
+            (5 * math.pi / 4, False),  # bottom-left
+            (7 * math.pi / 4, False),  # bottom-right
+        )
+        arc_box = (cx - r, cy - r, r * 2, r * 2)
+        half = chunk / 2
+        for angle, is_active in chunks:
+            color = active_color if is_active else idle
+            pygame.draw.arc(screen, color, arc_box, angle - half, angle + half, lw)
 
     @staticmethod
     def _draw_disc_icon(screen: pygame.Surface, center: tuple[int, int], ui_scale: float) -> None:
@@ -422,23 +505,26 @@ class GuideOverlay:
         item_font = pygame.font.SysFont(font_family, metrics["item_font"])
         time_font = pygame.font.SysFont(font_family, metrics["time_font"])
 
-        header_rect = pygame.Rect(block.x, block.y, block.width, header_h)
-        header_bg = pygame.Surface((header_rect.width, header_rect.height), pygame.SRCALPHA)
-        header_bg.fill((20, 28, 36, int(210 * mix)))
-        screen.blit(header_bg, header_rect.topleft)
-
-        title = title_font.render("Xbox Guide", True, pygame.Color(*_C_HEADER_TEXT))
+        title = title_font.render(page_title("Xbox Guide"), True, pygame.Color(*_C_HEADER_TEXT))
         screen.blit(title, (block.x + pad, block.y + pad // 2))
-        self._draw_xbox_orb(screen, (block.centerx, block.y + header_h // 2), ui_scale)
+        self._draw_header_emblem(
+            screen,
+            (block.centerx, block.y + header_h // 2),
+            ui_scale,
+            metrics["orb_half"],
+            metrics["orb_glow_pad"],
+        )
 
         ring_x = block.right - metrics["ring_inset"]
-        self._draw_player_ring(screen, (ring_x, block.y + pad), ui_scale)
+        settings_colors = (self.theme.get("settings_panel") or {}).get("colors") or {}
+        player_light = pygame.Color(settings_colors.get("tile", self.theme["colors"]["tile"]))
+        self._draw_player_ring(screen, (ring_x, block.y + pad), ui_scale, player_light)
         clock = datetime.now().strftime("%H:%M")
         clock_surf = time_font.render(clock, True, pygame.Color(*_C_HEADER_TEXT))
         screen.blit(clock_surf, (block.right - clock_surf.get_width() - pad, block.y + pad + 4))
 
-        body_y = block.y + header_h
-        body_h = block.height - header_h
+        body_y = content.y
+        body_h = content.height
 
         self._tab_hitboxes = []
         tab_positions: list[tuple[int, pygame.Rect]] = []
@@ -465,7 +551,7 @@ class GuideOverlay:
             pygame.draw.line(screen, pygame.Color(72, 92, 108), rect.topright, rect.bottomright, 1)
             label = _vertical_text(
                 tab_font,
-                GUIDE_SECTIONS[idx].label,
+                self._tab_label(idx),
                 pygame.Color(28, 36, 44) if active else pygame.Color(42, 52, 60),
             )
             lr = label.get_rect(center=rect.center)
@@ -502,7 +588,7 @@ class GuideOverlay:
             else:
                 text_color = pygame.Color(*_C_ROW_TEXT)
                 text_x = row.x + pad + 2
-            label = item_font.render(item.label, True, text_color)
+            label = item_font.render(page_title(item.label), True, text_color)
             screen.blit(label, (text_x, row.centery - label.get_height() // 2))
             if item.trailing_icon == "disc":
                 self._draw_disc_icon(screen, (row.right - pad * 2, row.centery), ui_scale)

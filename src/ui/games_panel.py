@@ -9,6 +9,8 @@ from typing import Any, Callable
 
 import pygame
 
+from ui.page_text import page_title
+
 # Slot order: 0-5 left grid (col0 then col1 per row), 6 hero, 7 Forza, 8 Cobalt
 _GAMES_NAV: dict[int, dict[str, int | None]] = {
     0: {"left": None, "right": 1, "up": None, "down": 2},
@@ -201,23 +203,19 @@ def _draw_green_tile(
     scale: float,
 ) -> None:
     green_dim = pygame.Color(72, 168, 52)
-    green_hi = pygame.Color(92, 196, 58)
+    green_hi = pygame.Color(106, 218, 68)
     white = pygame.Color(255, 255, 255)
 
-    draw_rect = rect
-    if selected:
-        lift = int(4 * scale)
-        inflate = int(6 * scale)
-        draw_rect = rect.inflate(inflate, inflate)
-        draw_rect.y -= lift
-
     fill = green_hi if selected else green_dim
-    pygame.draw.rect(surf, fill, draw_rect, border_radius=3)
-    icon_draw(surf, draw_rect, white)
-    lab = font.render(title, True, white)
-    surf.blit(lab, (draw_rect.x + int(10 * scale), draw_rect.bottom - lab.get_height() - int(8 * scale)))
+    pygame.draw.rect(surf, fill, rect, border_radius=3)
+    icon_draw(surf, rect, white)
+    lab = font.render(page_title(title), True, white)
+    surf.blit(lab, (rect.x + int(10 * scale), rect.bottom - lab.get_height() - int(8 * scale)))
     if selected:
-        pygame.draw.rect(surf, pygame.Color(255, 255, 255), draw_rect, width=2, border_radius=3)
+        border_w = max(2, int(3 * scale))
+        pygame.draw.rect(surf, white, rect, width=border_w, border_radius=3)
+        inner = rect.inflate(-border_w * 2, -border_w * 2)
+        pygame.draw.rect(surf, pygame.Color(180, 240, 140), inner, width=1, border_radius=2)
 
 
 def _draw_featured_tile(
@@ -236,7 +234,7 @@ def _draw_featured_tile(
     overlay = pygame.Surface((bar.w, bar.h), pygame.SRCALPHA)
     overlay.fill((0, 0, 0, 185))
     surf.blit(overlay, bar.topleft)
-    label = font.render(title, True, pygame.Color(255, 255, 255))
+    label = font.render(page_title(title), True, pygame.Color(255, 255, 255))
     surf.blit(label, (rect.x + 10, bar.y + (bar_h - label.get_height()) // 2))
     if selected:
         pygame.draw.rect(surf, pygame.Color(255, 255, 255), rect, width=3, border_radius=2)
@@ -272,17 +270,8 @@ def draw_games_panel(
             break
         sel = idx == selected_index
         title = SLOT_LABELS[idx]
-
         if idx <= 5:
-            _draw_green_tile(
-                screen,
-                rect,
-                title,
-                font_label,
-                sel,
-                green_icons[idx],
-                scale,
-            )
+            _draw_green_tile(screen, rect, title, font_label, sel, green_icons[idx], scale)
         else:
             accent = FEATURE_ACCENTS[idx - 6]
             _draw_featured_tile(screen, rect, title, font_feat, accent, sel)

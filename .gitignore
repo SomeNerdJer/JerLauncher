@@ -9,6 +9,10 @@ desktop.ini
 
 # Local runtime / user state
 src/config/display_state.json
+src/config/profile_state.json
+src/config/pinned_games.json
+src/config/hidden_games.json
+src/assets/gamerpics/custom.png
 
 # Optional: uncomment to keep art cache out of git
 # assets/cache/

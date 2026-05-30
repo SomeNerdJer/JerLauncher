@@ -12,12 +12,14 @@ from core.input_manager import InputManager
 from core.page_sounds import init_page_sounds
 from core.scene_manager import SceneManager
 from services.launcher import Launcher
+from ui.boot_scene import BootScene
 from ui.dashboard_scene import DashboardScene
 
 
 class MetroApp:
     def __init__(self) -> None:
         self.root = Path(__file__).resolve().parents[1]
+        self.project_root = self.root.parent
         self.theme = self._load_json(self.root / "config" / "theme.json")
         self.games = self._load_json(self.root / "config" / "games.json")
         self.state_path = self.root / "config" / "display_state.json"
@@ -35,14 +37,31 @@ class MetroApp:
         self.input_manager = InputManager()
         self.input_manager.initialize()
         self.launcher = Launcher()
+        self._dashboard: DashboardScene | None = None
 
-        dashboard = DashboardScene(
-            self.theme,
-            self.games,
-            self.launcher,
-            on_switch_display=self._cycle_display,
+        boot_video = self.project_root / "assets" / "xbox360metro.mp4"
+        self.scene_manager.set_scene(
+            BootScene(
+                self.theme,
+                boot_video,
+                self._enter_dashboard,
+                screen=self.screen,
+            )
         )
-        self.scene_manager.set_scene(dashboard)
+        boot_scene = self.scene_manager.current_scene
+        if boot_scene is not None:
+            boot_scene.render(self.screen)
+        pygame.display.flip()
+
+    def _enter_dashboard(self) -> None:
+        if self._dashboard is None:
+            self._dashboard = DashboardScene(
+                self.theme,
+                self.games,
+                self.launcher,
+                on_switch_display=self._cycle_display,
+            )
+        self.scene_manager.set_scene(self._dashboard)
 
     def run(self) -> None:
         running = True
@@ -62,12 +81,21 @@ class MetroApp:
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_F10:
                     self._cycle_display()
                     continue
-                if event.type in (pygame.CONTROLLERDEVICEADDED, pygame.CONTROLLERDEVICEREMOVED):
+                if event.type in (
+                    pygame.CONTROLLERDEVICEADDED,
+                    pygame.CONTROLLERDEVICEREMOVED,
+                    pygame.JOYDEVICEADDED,
+                    pygame.JOYDEVICEREMOVED,
+                ):
                     self.input_manager.handle_device_event(event)
                     continue
 
                 scene = self.scene_manager.current_scene
                 if scene is None:
+                    continue
+                if event.type == pygame.TEXTINPUT and scene.handle_text_input(event):
+                    continue
+                if event.type == pygame.KEYDOWN and scene.handle_keydown(event):
                     continue
                 for action in self.input_manager.actions_from_event(event):
                     scene.handle_action(action)
@@ -75,7 +103,10 @@ class MetroApp:
             scene = self.scene_manager.current_scene
             if scene is not None:
                 scene.update(dt)
+            scene = self.scene_manager.current_scene
+            if scene is not None:
                 scene.render(self.screen)
+            pygame.mouse.set_visible(self.input_manager.mouse_enabled)
             pygame.display.flip()
 
         self.state["last_display"] = self.display_index

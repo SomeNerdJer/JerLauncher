@@ -13,6 +13,7 @@ from typing import Any
 import pygame
 
 from services.game_library_key import row_library_key, row_store
+from ui.page_text import page_title
 
 # Project-root `assets/` — My Games popup backdrops (blue.webp default shelf, night.jpg loading).
 _MY_GAMES_BG_CACHE: dict[str, dict[str, Any]] = {}
@@ -248,6 +249,7 @@ def compute_my_games_panel_layout(
     *,
     filter_menu_open: bool,
     full_screen: bool = True,
+    show_filter_ui: bool = True,
 ) -> MyGamesPanelLayout:
     sw, sh = panel_w, panel_h
     scale = min(sw / 1024.0, sh / 576.0)
@@ -284,9 +286,12 @@ def compute_my_games_panel_layout(
             )
 
     footer_reserve = int(46 * scale)
-    base_strip_gap = int((88 if full_screen else 96) * scale)
+    if show_filter_ui:
+        base_strip_gap = int((88 if full_screen else 96) * scale)
+    else:
+        base_strip_gap = int((52 if full_screen else 60) * scale)
     strip_top = content_top + base_strip_gap
-    if filter_menu_open:
+    if show_filter_ui and filter_menu_open:
         strip_top = max(strip_top, dropdown_panel_rect.bottom + int(14 * scale))
 
     tile_h = int(max(212 * scale, min((sh - strip_top - footer_reserve) * 0.9, sh * 0.72)))
@@ -311,6 +316,130 @@ def compute_my_games_panel_layout(
     )
 
 
+def _my_game_tile_rect(
+    index: int,
+    *,
+    margin_x: int,
+    pitch: int,
+    scroll: int,
+    strip_top: int,
+    tile_w: int,
+    tile_h: int,
+    selected_index: int,
+    sel_scale: float,
+) -> pygame.Rect:
+    slot_x = margin_x + index * pitch - scroll
+    if index == selected_index:
+        tw = int(tile_w * sel_scale)
+        th = int(tile_h * sel_scale)
+        return pygame.Rect(
+            slot_x + (tile_w - tw) // 2,
+            strip_top + (tile_h - th) // 2,
+            tw,
+            th,
+        )
+    return pygame.Rect(slot_x, strip_top, tile_w, tile_h)
+
+
+def _draw_my_game_tile(
+    screen: pygame.Surface,
+    rect: pygame.Rect,
+    game: dict[str, Any],
+    *,
+    is_sel: bool,
+    art_cache: dict[str, pygame.Surface | None],
+    scaled_cache: dict[tuple[str, int, int], pygame.Surface],
+    load_header_fn: Callable[[str, str | None], None],
+    tiny_font: pygame.font.Font,
+    tile_title_font: pygame.font.Font,
+    scale: float,
+) -> None:
+    library_key = row_library_key(game)
+    if art_cache.get(library_key) is None:
+        load_header_fn(library_key, game.get("header_image"))
+
+    store = row_store(game)
+    banner_h = max(22, int(24 * scale))
+    if store == "epic":
+        ban_bg = pygame.Color(54, 58, 72) if not is_sel else pygame.Color(230, 232, 240)
+        ban_fg = pygame.Color(230, 232, 255) if not is_sel else pygame.Color(60, 64, 82)
+        ban_label = "EPIC"
+        plat_text = "+ Epic Games"
+    elif store == "ea":
+        ban_bg = pygame.Color(42, 46, 54) if not is_sel else pygame.Color(236, 238, 242)
+        ban_fg = pygame.Color(255, 235, 220) if not is_sel else pygame.Color(72, 52, 38)
+        ban_label = "EA"
+        plat_text = "+ EA app"
+    elif store == "rockstar":
+        ban_bg = pygame.Color(36, 32, 28) if not is_sel else pygame.Color(242, 238, 228)
+        ban_fg = pygame.Color(240, 200, 72) if not is_sel else pygame.Color(52, 46, 38)
+        ban_label = "R*"
+        plat_text = "+ Rockstar"
+    elif store == "steam":
+        ban_bg = pygame.Color(210, 92, 58) if not is_sel else pygame.Color(245, 245, 248)
+        ban_fg = pygame.Color(255, 255, 255) if not is_sel else pygame.Color(90, 94, 98)
+        ban_label = "STEAM"
+        plat_text = "+ Steam"
+    else:
+        ban_bg = pygame.Color(120, 122, 128) if not is_sel else pygame.Color(245, 245, 248)
+        ban_fg = pygame.Color(255, 255, 255) if not is_sel else pygame.Color(70, 74, 78)
+        ban_label = "GAME"
+        plat_text = "+ Library"
+    pygame.draw.rect(screen, ban_bg, pygame.Rect(rect.x, rect.y, rect.w, banner_h))
+    banner_key = (store, is_sel)
+    banner_cached = _STORE_BANNER_CACHE.get(banner_key)
+    if banner_cached is None:
+        ban_txt = tiny_font.render(ban_label, True, ban_fg)
+        plat = tiny_font.render(plat_text, True, pygame.Color(80, 84, 90))
+        _STORE_BANNER_CACHE[banner_key] = (ban_txt, plat)
+    else:
+        ban_txt, plat = banner_cached
+
+    gtitle = game["title"]
+    if len(gtitle) > 28:
+        gtitle = gtitle[:25] + "…"
+    name_s = _TILE_TITLE_CACHE.get(gtitle)
+    if name_s is None:
+        name_s = tile_title_font.render(gtitle, True, pygame.Color(28, 30, 34))
+        _TILE_TITLE_CACHE[gtitle] = name_s
+    ach, gs = _stat_placeholders(tiny_font)
+    screen.blit(ban_txt, (rect.x + 8, rect.y + (banner_h - ban_txt.get_height()) // 2))
+
+    foot_pad_x = int(8 * scale)
+    foot_pad_top = int(8 * scale)
+    foot_pad_bottom = int(8 * scale)
+    gap_label = int(6 * scale)
+    stat_row_h = max(ach.get_height(), gs.get_height())
+    min_footer_h = (
+        foot_pad_top + name_s.get_height() + gap_label + stat_row_h + gap_label + plat.get_height() + foot_pad_bottom
+    )
+    footer_h = int(max(min_footer_h, 72 * scale, rect.h * 0.2))
+    foot_top = rect.bottom - footer_h
+
+    art_rect = pygame.Rect(rect.x, rect.y + banner_h, rect.w, rect.h - banner_h - footer_h)
+    scaled = scaled_tile_art(scaled_cache, art_cache, library_key, art_rect.w, art_rect.h)
+    if scaled is not None:
+        screen.blit(scaled, art_rect.topleft)
+    else:
+        pygame.draw.rect(screen, pygame.Color(120, 122, 128), art_rect)
+        _draw_pad_glyph(screen, art_rect)
+
+    pygame.draw.rect(screen, pygame.Color(248, 248, 250), pygame.Rect(rect.x, foot_top, rect.w, rect.bottom - foot_top))
+
+    fy_line = foot_top + foot_pad_top
+    screen.blit(name_s, (rect.x + foot_pad_x, fy_line))
+    fy_line += name_s.get_height() + gap_label
+    screen.blit(ach, (rect.x + foot_pad_x, fy_line))
+    screen.blit(gs, (rect.x + foot_pad_x + ach.get_width() + int(10 * scale), fy_line))
+    fy_line += ach.get_height() + gap_label
+    screen.blit(plat, (rect.x + foot_pad_x, fy_line))
+
+    _draw_mini_pad(screen, rect.right - int(28 * scale), rect.bottom - int(22 * scale), scale)
+
+    if is_sel:
+        pygame.draw.rect(screen, pygame.Color(255, 255, 255), rect, width=3, border_radius=2)
+
+
 def draw_my_games_submenu(
     screen: pygame.Surface,
     theme: dict[str, Any],
@@ -325,6 +454,9 @@ def draw_my_games_submenu(
     filter_menu_selected_index: int = 0,
     filter_focused: bool = False,
     full_screen: bool = False,
+    shelf_title: str = "my games",
+    show_filter_ui: bool = True,
+    empty_message: str = "No games match this filter.",
 ) -> MyGamesPanelLayout:
     """Full-area overlay; loads header art via load_header_fn(library_key, path). Returns layout for hit-testing."""
     sw, sh = screen.get_size()
@@ -333,6 +465,7 @@ def draw_my_games_submenu(
         sh,
         filter_menu_open=filter_menu_open,
         full_screen=full_screen,
+        show_filter_ui=show_filter_ui,
     )
     scale = layout.scale
     margin_x = layout.margin_x
@@ -351,23 +484,27 @@ def draw_my_games_submenu(
     filter_font = _sys_font(font_f, int(17 * scale))
     scaled_cache = scaled_art_cache if scaled_art_cache is not None else {}
     fy = content_top + int(12 * scale)
-    show1 = filter_font.render("show me", True, pygame.Color(colors["text_dim"]))
-    filter_sub = filter_label_for_id(filter_id)
-    show2 = tiny_font.render(filter_sub, True, pygame.Color(160, 164, 172))
-    screen.blit(show1, (margin_x, fy))
-    screen.blit(show2, (margin_x, layout.filter_line2_y))
-    if filter_menu_open or filter_focused:
-        fr = layout.filter_button_rect.inflate(6, 4)
-        border = pygame.Color(72, 120, 196) if filter_menu_open else pygame.Color(100, 108, 120)
-        pygame.draw.rect(screen, border, fr, width=2, border_radius=3)
+    if show_filter_ui:
+        show1 = filter_font.render("show me", True, pygame.Color(colors["text_dim"]))
+        filter_sub = filter_label_for_id(filter_id)
+        show2 = tiny_font.render(filter_sub, True, pygame.Color(160, 164, 172))
+        screen.blit(show1, (margin_x, fy))
+        screen.blit(show2, (margin_x, layout.filter_line2_y))
+        if filter_menu_open or filter_focused:
+            fr = layout.filter_button_rect.inflate(6, 4)
+            border = pygame.Color(72, 120, 196) if filter_menu_open else pygame.Color(100, 108, 120)
+            pygame.draw.rect(screen, border, fr, width=2, border_radius=3)
 
-    sort_x = margin_x + max(160, int(180 * scale))
-    so1 = filter_font.render("sort", True, pygame.Color(colors["text_dim"]))
-    so2 = tiny_font.render("titles", True, pygame.Color(160, 164, 172))
-    screen.blit(so1, (sort_x, fy))
-    screen.blit(so2, (sort_x, fy + so1.get_height()))
+        sort_x = margin_x + max(160, int(180 * scale))
+        so1 = filter_font.render("sort", True, pygame.Color(colors["text_dim"]))
+        so2 = tiny_font.render("titles", True, pygame.Color(160, 164, 172))
+        screen.blit(so1, (sort_x, fy))
+        screen.blit(so2, (sort_x, fy + so1.get_height()))
+    else:
+        hint = tiny_font.render("Pinned games", True, pygame.Color(160, 164, 172))
+        screen.blit(hint, (margin_x, fy + 4))
 
-    header_title = title_font.render("My Games", True, pygame.Color(255, 255, 255))
+    header_title = title_font.render(page_title(shelf_title), True, pygame.Color(255, 255, 255))
     n = len(games)
     sel_display = min(selected_index + 1, max(1, n)) if n else 0
     counter = small_font.render(f"{sel_display} of {n}", True, pygame.Color(180, 184, 190))
@@ -398,7 +535,7 @@ def draw_my_games_submenu(
 
     if n == 0:
         msg = small_font.render(
-            "No games match this filter.",
+            empty_message,
             True,
             pygame.Color(200, 200, 205),
         )
@@ -411,101 +548,45 @@ def draw_my_games_submenu(
     scroll = max(0, min(si * pitch + tile_w // 2 - viewport_w // 2, max(0, total_w - viewport_w)))
 
     sel_scale = 1.08
-    for i in range(n):
-        x = margin_x + i * pitch - scroll
-        if x + tile_w < margin_x or x > sw - margin_x:
-            continue
-        is_sel = i == si
-        tw = int(tile_w * (sel_scale if is_sel else 1.0))
-        th = int(tile_h * (sel_scale if is_sel else 1.0))
-        ty_offset = int((tile_h - th) * 0.35) if is_sel else 0
-        rect = pygame.Rect(x, strip_top + ty_offset, tw, th)
+    right_edge = sw - margin_x
 
-        game = games[i]
-        library_key = row_library_key(game)
-        if art_cache.get(library_key) is None:
-            load_header_fn(library_key, game.get("header_image"))
+    def _tile_visible(i: int) -> bool:
+        slot_x = margin_x + i * pitch - scroll
+        return slot_x + tile_w >= margin_x and slot_x <= right_edge
 
-        store = row_store(game)
-        banner_h = max(22, int(24 * scale))
-        if store == "epic":
-            ban_bg = pygame.Color(54, 58, 72) if not is_sel else pygame.Color(230, 232, 240)
-            ban_fg = pygame.Color(230, 232, 255) if not is_sel else pygame.Color(60, 64, 82)
-            ban_label = "EPIC"
-            plat_text = "+ Epic Games"
-        elif store == "ea":
-            ban_bg = pygame.Color(42, 46, 54) if not is_sel else pygame.Color(236, 238, 242)
-            ban_fg = pygame.Color(255, 235, 220) if not is_sel else pygame.Color(72, 52, 38)
-            ban_label = "EA"
-            plat_text = "+ EA app"
-        elif store == "rockstar":
-            ban_bg = pygame.Color(36, 32, 28) if not is_sel else pygame.Color(242, 238, 228)
-            ban_fg = pygame.Color(240, 200, 72) if not is_sel else pygame.Color(52, 46, 38)
-            ban_label = "R*"
-            plat_text = "+ Rockstar"
-        elif store == "steam":
-            ban_bg = pygame.Color(210, 92, 58) if not is_sel else pygame.Color(245, 245, 248)
-            ban_fg = pygame.Color(255, 255, 255) if not is_sel else pygame.Color(90, 94, 98)
-            ban_label = "STEAM"
-            plat_text = "+ Steam"
-        else:
-            ban_bg = pygame.Color(120, 122, 128) if not is_sel else pygame.Color(245, 245, 248)
-            ban_fg = pygame.Color(255, 255, 255) if not is_sel else pygame.Color(70, 74, 78)
-            ban_label = "GAME"
-            plat_text = "+ Library"
-        pygame.draw.rect(screen, ban_bg, pygame.Rect(rect.x, rect.y, rect.w, banner_h))
-        banner_key = (store, is_sel)
-        banner_cached = _STORE_BANNER_CACHE.get(banner_key)
-        if banner_cached is None:
-            ban_txt = tiny_font.render(ban_label, True, ban_fg)
-            plat = tiny_font.render(plat_text, True, pygame.Color(80, 84, 90))
-            _STORE_BANNER_CACHE[banner_key] = (ban_txt, plat)
-        else:
-            ban_txt, plat = banner_cached
-
-        gtitle = game["title"]
-        if len(gtitle) > 28:
-            gtitle = gtitle[:25] + "…"
-        name_s = _TILE_TITLE_CACHE.get(gtitle)
-        if name_s is None:
-            name_s = tile_title_font.render(gtitle, True, pygame.Color(28, 30, 34))
-            _TILE_TITLE_CACHE[gtitle] = name_s
-        ach, gs = _stat_placeholders(tiny_font)
-        screen.blit(ban_txt, (rect.x + 8, rect.y + (banner_h - ban_txt.get_height()) // 2))
-
-        foot_pad_x = int(8 * scale)
-        foot_pad_top = int(8 * scale)
-        foot_pad_bottom = int(8 * scale)
-        gap_label = int(6 * scale)
-        stat_row_h = max(ach.get_height(), gs.get_height())
-        min_footer_h = (
-            foot_pad_top + name_s.get_height() + gap_label + stat_row_h + gap_label + plat.get_height() + foot_pad_bottom
+    def _draw_index(i: int, *, selected: bool) -> None:
+        if not _tile_visible(i):
+            return
+        rect = _my_game_tile_rect(
+            i,
+            margin_x=margin_x,
+            pitch=pitch,
+            scroll=scroll,
+            strip_top=strip_top,
+            tile_w=tile_w,
+            tile_h=tile_h,
+            selected_index=si if selected else -1,
+            sel_scale=sel_scale,
         )
-        footer_h = int(max(min_footer_h, 72 * scale, rect.h * 0.2))
-        foot_top = rect.bottom - footer_h
+        _draw_my_game_tile(
+            screen,
+            rect,
+            games[i],
+            is_sel=selected,
+            art_cache=art_cache,
+            scaled_cache=scaled_cache,
+            load_header_fn=load_header_fn,
+            tiny_font=tiny_font,
+            tile_title_font=tile_title_font,
+            scale=scale,
+        )
 
-        art_rect = pygame.Rect(rect.x, rect.y + banner_h, rect.w, rect.h - banner_h - footer_h)
-        scaled = scaled_tile_art(scaled_cache, art_cache, library_key, art_rect.w, art_rect.h)
-        if scaled is not None:
-            screen.blit(scaled, art_rect.topleft)
-        else:
-            pygame.draw.rect(screen, pygame.Color(120, 122, 128), art_rect)
-            _draw_pad_glyph(screen, art_rect)
+    for i in range(n):
+        if i != si:
+            _draw_index(i, selected=False)
 
-        pygame.draw.rect(screen, pygame.Color(248, 248, 250), pygame.Rect(rect.x, foot_top, rect.w, rect.bottom - foot_top))
-
-        fy_line = foot_top + foot_pad_top
-        screen.blit(name_s, (rect.x + foot_pad_x, fy_line))
-        fy_line += name_s.get_height() + gap_label
-        screen.blit(ach, (rect.x + foot_pad_x, fy_line))
-        screen.blit(gs, (rect.x + foot_pad_x + ach.get_width() + int(10 * scale), fy_line))
-        fy_line += ach.get_height() + gap_label
-        screen.blit(plat, (rect.x + foot_pad_x, fy_line))
-
-        _draw_mini_pad(screen, rect.right - int(28 * scale), rect.bottom - int(22 * scale), scale)
-
-        if is_sel:
-            pygame.draw.rect(screen, pygame.Color(255, 255, 255), rect.inflate(6, 6), width=3, border_radius=2)
+    if 0 <= si < n:
+        _draw_index(si, selected=True)
 
     _draw_footer_hints(screen, margin_x, sh, scale, tiny_font)
     return layout
@@ -533,6 +614,7 @@ def hit_test_my_games_tile(
     selected_index: int,
     *,
     full_screen: bool = True,
+    show_filter_ui: bool = True,
 ) -> int | None:
     """Coordinates must be relative to the My Games panel surface (0..panel_w)."""
     if games_count <= 0:
@@ -542,6 +624,7 @@ def hit_test_my_games_tile(
         panel_h,
         filter_menu_open=False,
         full_screen=full_screen,
+        show_filter_ui=show_filter_ui,
     )
     margin_x = layout.margin_x
     strip_top = layout.strip_top
@@ -554,9 +637,19 @@ def hit_test_my_games_tile(
     total_w = games_count * pitch - gap
     scroll = max(0, min(si * pitch + tile_w // 2 - viewport_w // 2, max(0, total_w - viewport_w)))
 
+    sel_scale = 1.08
     for i in range(games_count):
-        x = margin_x + i * pitch - scroll
-        rect = pygame.Rect(x, strip_top, tile_w, tile_h)
+        rect = _my_game_tile_rect(
+            i,
+            margin_x=margin_x,
+            pitch=pitch,
+            scroll=scroll,
+            strip_top=strip_top,
+            tile_w=tile_w,
+            tile_h=tile_h,
+            selected_index=si,
+            sel_scale=sel_scale,
+        )
         if rect.collidepoint(mx, my):
             return i
     return None

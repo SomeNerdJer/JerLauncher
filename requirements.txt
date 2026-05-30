@@ -1,2 +1,5 @@
 pygame-ce
 pycryptodome
+opencv-python-headless
+ffpyplayer
+imageio-ffmpeg

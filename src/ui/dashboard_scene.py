@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import ctypes
 import json
 import os
@@ -18,6 +19,18 @@ from typing import Any, Callable
 import pygame
 
 from core.page_sounds import play_hub_page_sound
+from core.pinned_games import load_pinned_library_keys, save_pinned_library_keys
+from core.profile_state import (
+    CUSTOM_GAMERPIC_REL,
+    DEFAULT_GAMERTAG,
+    GAMERPIC_GRID_COLS,
+    MAX_GAMERTAG_LEN,
+    copy_gamerpic_file,
+    gamerpic_absolute,
+    gamerpic_grid_slots,
+    load_profile,
+    save_profile,
+)
 from services.ea_library import list_installed_ea_games
 from services.epic_library import list_installed_epic_games
 from services.rockstar_library import list_installed_rockstar_games
@@ -36,6 +49,8 @@ from services.steam_library import (
 )
 from ui.guide_overlay import GuideOverlay
 from ui.games_panel import build_slot_rects, draw_games_panel, games_navigate
+from ui.home_icons import draw_home_tile_icon, draw_tile_icon
+from ui.page_text import page_title
 from ui.my_games_submenu import (
     FILTER_ID_TO_INDEX,
     MY_GAMES_FILTERS,
@@ -59,6 +74,9 @@ class DashboardScene:
         return row_store(game)
 
     def _game_by_library_key(self, library_key: str) -> dict[str, Any] | None:
+        for g in self._my_pins_entries:
+            if DashboardScene._game_library_key(g) == library_key:
+                return g
         for g in self._my_games_entries:
             if DashboardScene._game_library_key(g) == library_key:
                 return g
@@ -66,6 +84,25 @@ class DashboardScene:
             if DashboardScene._game_library_key(g) == library_key:
                 return g
         return None
+
+    def _library_shelf_active(self) -> bool:
+        return self._library_shelf_kind in ("games", "pins")
+
+    def _shelf_entries(self) -> list[dict[str, Any]]:
+        if self._library_shelf_kind == "pins":
+            return self._my_pins_entries
+        return self._my_games_entries
+
+    def _shelf_selected_index(self) -> int:
+        if self._library_shelf_kind == "pins":
+            return self._my_pins_selected_index
+        return self._my_games_selected_index
+
+    def _set_shelf_selected_index(self, value: int) -> None:
+        if self._library_shelf_kind == "pins":
+            self._my_pins_selected_index = value
+        else:
+            self._my_games_selected_index = value
 
     def __init__(
         self,
@@ -87,8 +124,10 @@ class DashboardScene:
         self._tile_origin_y = 170
         self._games_selected_index = 0
         self._games_tile_rects: list[pygame.Rect] = []
-        self._in_my_games_submenu = False
+        self._library_shelf_kind: str | None = None
         self._my_games_entries: list[dict[str, Any]] = []
+        self._my_pins_entries: list[dict[str, Any]] = []
+        self._my_pins_selected_index = 0
         self._my_games_titles: dict[str, str] = {}
         self._my_games_selected_index = 0
         self._my_games_art_cache: dict[str, pygame.Surface | None] = {}
@@ -128,6 +167,7 @@ class DashboardScene:
         self._my_games_filter_menu_index: int = 0
         self._my_games_filter_focused: bool = False
         self._hidden_library_keys = self._load_hidden_library_keys()
+        self._pinned_library_keys = load_pinned_library_keys()
         self._steam_input_cache = self._load_steam_input_cache()
         self._steam_input_refresh_pending = False
         self._hub_rects: list[pygame.Rect] = []
@@ -145,7 +185,16 @@ class DashboardScene:
         self._in_display_submenu = False
         self._in_system_info_submenu = False
         self._in_art_submenu = False
+        self._profile_edit_mode: str | None = None
+        self._profile_edit_buffer = ""
+        self._gamerpic_grid_index = 0
+        self._gamerpic_grid_rects: list[pygame.Rect] = []
+        self._gamerpic_thumb_cache: dict[str, pygame.Surface] = {}
+        # "sidebar" = left list; "panel" = right content (gamertag edit, etc.)
+        self._settings_submenu_focus: str = "sidebar"
+        self._gamerpic_grid_engaged = False
         self._last_settings_submenu: str | None = None
+        self._settings_submenu_return_index = 0
         self._display_selected_index = 0
         self._display_option_rects: list[pygame.Rect] = []
         self._display_transition_progress = 0.0
@@ -159,7 +208,13 @@ class DashboardScene:
         self._power_transition_progress = 0.0
         self._power_transition_target = 0.0
         self._power_transition_duration_s = 0.12
-        self.guide = GuideOverlay(theme)
+        profile = load_profile()
+        pic_path = gamerpic_absolute(profile.get("gamerpic"))
+        self.guide = GuideOverlay(
+            theme,
+            gamertag=profile.get("gamertag", DEFAULT_GAMERTAG),
+            gamerpic_path=pic_path,
+        )
         self._exit_rect = pygame.Rect(0, 0, 0, 0)
         self._bg_image: pygame.Surface | None = None
         self._bg_scaled: pygame.Surface | None = None
@@ -168,6 +223,40 @@ class DashboardScene:
         self._display_bg_scaled: pygame.Surface | None = None
         self._display_bg_scaled_size: tuple[int, int] | None = None
         self._load_background_image()
+
+    def handle_text_input(self, event: pygame.event.Event) -> bool:
+        if (
+            not self._in_art_submenu
+            or self._settings_submenu_focus != "panel"
+            or self._profile_edit_mode != "gamertag"
+        ):
+            return False
+        text = event.text
+        if not text:
+            return True
+        room = MAX_GAMERTAG_LEN - len(self._profile_edit_buffer)
+        if room <= 0:
+            return True
+        self._profile_edit_buffer += text[:room]
+        return True
+
+    def handle_keydown(self, event: pygame.event.Event) -> bool:
+        if (
+            not self._in_art_submenu
+            or self._settings_submenu_focus != "panel"
+            or self._profile_edit_mode != "gamertag"
+        ):
+            return False
+        if event.key == pygame.K_RETURN:
+            self._save_gamertag_edit()
+            return True
+        if event.key == pygame.K_ESCAPE:
+            self._profile_edit_mode = None
+            return True
+        if event.key == pygame.K_BACKSPACE:
+            self._profile_edit_buffer = self._profile_edit_buffer[:-1]
+            return True
+        return False
 
     def handle_action(self, action: str) -> None:
         if action == "TOGGLE_GUIDE":
@@ -194,6 +283,18 @@ class DashboardScene:
 
         if self._hub_transition_active:
             return
+        if self._settings_submenu_transitioning():
+            if action in {
+                "MOVE_LEFT",
+                "MOVE_RIGHT",
+                "MOVE_UP",
+                "MOVE_DOWN",
+                "SELECT",
+                "DETAILS",
+                "HUB_PREV",
+                "HUB_NEXT",
+            } or action.startswith("MOUSE_"):
+                return
         if action.startswith("MOUSE_HOVER:"):
             _, sx, sy = action.split(":")
             hover_pos = (int(sx), int(sy))
@@ -202,19 +303,24 @@ class DashboardScene:
                 if hover_index is not None:
                     self._power_selected_index = hover_index
                 return
+            if self._library_shelf_active():
+                self._shelf_mouse_hover(hover_pos)
+                return
             if self._active_hub() == "Home":
                 hover_index = self._home_index_at_pos(hover_pos)
                 if hover_index is not None:
                     self._home_selected_index = hover_index
             elif self._active_hub() == "Settings":
-                if self._in_display_submenu:
+                if self._in_display_submenu or self._in_art_submenu:
+                    if self._gamerpic_grid_is_active():
+                        grid_index = self._gamerpic_grid_index_at_pos(hover_pos)
+                        if grid_index is not None:
+                            self._gamerpic_grid_index = grid_index
+                            return
                     hover_index = self._display_option_index_at_pos(hover_pos)
                     if hover_index is not None:
                         self._display_selected_index = hover_index
-                elif self._in_art_submenu:
-                    hover_index = self._display_option_index_at_pos(hover_pos)
-                    if hover_index is not None:
-                        self._display_selected_index = hover_index
+                        self._leave_gamerpic_grid_if_needed()
                 elif self._in_system_info_submenu:
                     return
                 else:
@@ -222,41 +328,6 @@ class DashboardScene:
                     if hover_index is not None:
                         self._settings_selected_index = hover_index
             elif self._active_hub() == "Games":
-                if self._in_my_games_submenu:
-                    if self._in_my_game_details_submenu:
-                        return
-                    surf = pygame.display.get_surface()
-                    if surf is None:
-                        return
-                    sw, sh = surf.get_size()
-                    px, py, pw, ph = self._my_games_popup_screen_rect(sw, sh)
-                    lx = hover_pos[0] - px
-                    ly = hover_pos[1] - py
-                    if 0 <= lx < pw and 0 <= ly < ph:
-                        layout = compute_my_games_panel_layout(
-                            pw,
-                            ph,
-                            filter_menu_open=self._my_games_filter_menu_open,
-                            full_screen=True,
-                        )
-                        if self._my_games_filter_menu_open:
-                            hi_dd = hit_test_my_games_filter_dropdown(lx, ly, layout)
-                            if hi_dd is not None:
-                                self._my_games_filter_menu_index = hi_dd
-                        if not self._my_games_filter_menu_open:
-                            hi = hit_test_my_games_tile(
-                                lx,
-                                ly,
-                                pw,
-                                ph,
-                                len(self._my_games_entries),
-                                self._my_games_selected_index,
-                                full_screen=True,
-                            )
-                            if hi is not None and hi != self._my_games_selected_index:
-                                self._my_games_selected_index = hi
-                                self._my_games_filter_focused = False
-                    return
                 hover_index = self._games_index_at_pos(hover_pos)
                 if hover_index is not None:
                     self._games_selected_index = hover_index
@@ -277,27 +348,32 @@ class DashboardScene:
                     self._apply_power_action(self._power_options[self._power_selected_index])
                 return
 
+            if self._library_shelf_active():
+                self._shelf_mouse_click(click_pos)
+                return
+
             clicked_hub = self._hub_index_at_pos(click_pos)
             if clicked_hub is not None:
                 self._set_hub(clicked_hub)
                 return
-
             if self._active_hub() == "Home":
                 clicked_index = self._home_index_at_pos(click_pos)
                 if clicked_index is not None:
                     self._home_selected_index = clicked_index
                     self._launch_selected()
             elif self._active_hub() == "Settings":
-                if self._in_display_submenu:
+                if self._in_display_submenu or self._in_art_submenu:
+                    grid_index = self._gamerpic_grid_index_at_pos(click_pos)
+                    if grid_index is not None and self._gamerpic_grid_engaged:
+                        self._gamerpic_grid_index = grid_index
+                        self._apply_gamerpic_grid_selection()
+                        return
                     clicked_index = self._display_option_index_at_pos(click_pos)
                     if clicked_index is not None:
+                        self._settings_submenu_focus = "sidebar"
                         self._display_selected_index = clicked_index
-                        self._launch_selected()
-                elif self._in_art_submenu:
-                    clicked_index = self._display_option_index_at_pos(click_pos)
-                    if clicked_index is not None:
-                        self._display_selected_index = clicked_index
-                        self._launch_selected()
+                        self._leave_gamerpic_grid_if_needed()
+                        return
                 elif self._in_system_info_submenu:
                     return
                 else:
@@ -306,64 +382,6 @@ class DashboardScene:
                         self._settings_selected_index = clicked_index
                         self._launch_selected()
             elif self._active_hub() == "Games":
-                if self._in_my_games_submenu:
-                    if self._in_my_game_details_submenu:
-                        for idx, rect in enumerate(self._my_game_details_option_rects):
-                            if rect.collidepoint(click_pos):
-                                self._my_game_details_selected_index = idx
-                                self._apply_my_game_details_action()
-                                break
-                        return
-                    surf = pygame.display.get_surface()
-                    if surf is None:
-                        return
-                    sw, sh = surf.get_size()
-                    px, py, pw, ph = self._my_games_popup_screen_rect(sw, sh)
-                    lx = click_pos[0] - px
-                    ly = click_pos[1] - py
-                    if not (0 <= lx < pw and 0 <= ly < ph):
-                        return
-                    layout = compute_my_games_panel_layout(
-                        pw,
-                        ph,
-                        filter_menu_open=self._my_games_filter_menu_open,
-                        full_screen=True,
-                    )
-                    if self._my_games_filter_menu_open:
-                        dd_idx = hit_test_my_games_filter_dropdown(lx, ly, layout)
-                        if dd_idx is not None:
-                            self._my_games_filter_id = MY_GAMES_FILTERS[dd_idx][0]
-                            self._my_games_filter_menu_open = False
-                            self._apply_my_games_filter()
-                            self._my_games_selected_index = min(
-                                self._my_games_selected_index,
-                                max(0, len(self._my_games_entries) - 1),
-                            )
-                            return
-                        if hit_test_my_games_filter_button(lx, ly, layout):
-                            self._my_games_filter_menu_open = False
-                            return
-                        self._my_games_filter_menu_open = False
-                        self._my_games_filter_focused = False
-                        return
-                    if hit_test_my_games_filter_button(lx, ly, layout):
-                        self._my_games_filter_focused = True
-                        self._open_my_games_filter_menu()
-                        return
-                    ci = hit_test_my_games_tile(
-                        lx,
-                        ly,
-                        pw,
-                        ph,
-                        len(self._my_games_entries),
-                        self._my_games_selected_index,
-                        full_screen=True,
-                    )
-                    if ci is not None:
-                        self._my_games_selected_index = ci
-                        self._my_games_filter_focused = False
-                        self._launch_selected()
-                    return
                 clicked_index = self._games_index_at_pos(click_pos)
                 if clicked_index is not None:
                     self._games_selected_index = clicked_index
@@ -378,7 +396,7 @@ class DashboardScene:
         if self._in_power_menu and action not in {"MOVE_UP", "MOVE_DOWN", "SELECT", "BACK"}:
             return
 
-        if self._in_my_games_submenu and self._my_games_loading:
+        if self._library_shelf_active() and self._my_games_loading:
             if action == "BACK":
                 pass
             elif action.startswith("MOUSE_HOVER:"):
@@ -388,8 +406,7 @@ class DashboardScene:
 
         if (
             action == "DETAILS"
-            and self._active_hub() == "Games"
-            and self._in_my_games_submenu
+            and self._library_shelf_kind == "games"
             and not self._my_games_filter_menu_open
             and not self._in_my_game_details_submenu
             and self._my_games_entries
@@ -408,32 +425,32 @@ class DashboardScene:
         elif action == "MOVE_LEFT":
             if self._in_power_menu:
                 return
+            if self._handle_library_shelf_navigation(action):
+                return
             if self._active_hub() == "Home":
                 self._home_move(-1, 0)
             elif self._active_hub() == "Settings":
+                if self._gamerpic_grid_is_active() and self._gamerpic_grid_nav(-1, 0):
+                    return
                 if self._in_display_submenu or self._in_art_submenu:
                     return
                 if self._in_system_info_submenu:
                     return
                 self._settings_selected_index = max(0, self._settings_selected_index - 1)
             elif self._active_hub() == "Games":
-                if self._in_my_games_submenu:
-                    if self._my_games_filter_menu_open or self._my_games_filter_focused:
-                        return
-                    if self._in_my_game_details_submenu:
-                        return
-                    if self._my_games_entries:
-                        self._my_games_selected_index = max(0, self._my_games_selected_index - 1)
-                    return
                 self._games_selected_index = games_navigate(self._games_selected_index, "left")
             else:
                 self.rail.move(-1)
         elif action == "MOVE_RIGHT":
             if self._in_power_menu:
                 return
+            if self._handle_library_shelf_navigation(action):
+                return
             if self._active_hub() == "Home":
                 self._home_move(1, 0)
             elif self._active_hub() == "Settings":
+                if self._gamerpic_grid_is_active() and self._gamerpic_grid_nav(1, 0):
+                    return
                 if self._in_display_submenu or self._in_art_submenu:
                     return
                 if self._in_system_info_submenu:
@@ -441,17 +458,6 @@ class DashboardScene:
                 max_index = self._settings_slot_count() - 1
                 self._settings_selected_index = min(max_index, self._settings_selected_index + 1)
             elif self._active_hub() == "Games":
-                if self._in_my_games_submenu:
-                    if self._my_games_filter_menu_open or self._my_games_filter_focused:
-                        return
-                    if self._in_my_game_details_submenu:
-                        return
-                    if self._my_games_entries:
-                        self._my_games_selected_index = min(
-                            len(self._my_games_entries) - 1,
-                            self._my_games_selected_index + 1,
-                        )
-                    return
                 self._games_selected_index = games_navigate(self._games_selected_index, "right")
             else:
                 self.rail.move(1)
@@ -461,29 +467,22 @@ class DashboardScene:
                     return
                 self._power_selected_index = (self._power_selected_index - 1) % len(self._power_options)
                 return
+            if self._handle_library_shelf_navigation(action):
+                return
             if self._active_hub() == "Home":
                 self._home_move(0, -1)
             elif self._active_hub() == "Settings":
-                if self._in_display_submenu:
-                    self._display_selected_index = max(0, self._display_selected_index - 1)
-                elif self._in_art_submenu:
-                    self._display_selected_index = max(0, self._display_selected_index - 1)
+                if self._in_display_submenu or self._in_art_submenu:
+                    if self._profile_edit_mode:
+                        return
+                    if self._gamerpic_grid_is_active() and self._gamerpic_grid_nav(0, -1):
+                        return
+                    self._move_settings_submenu_selection(-1)
                 elif self._in_system_info_submenu:
                     return
                 else:
                     self._settings_selected_index = max(0, self._settings_selected_index - 4)
             elif self._active_hub() == "Games":
-                if self._in_my_games_submenu:
-                    if self._my_games_filter_menu_open:
-                        self._my_games_filter_menu_index = (self._my_games_filter_menu_index - 1) % len(
-                            MY_GAMES_FILTERS
-                        )
-                        return
-                    if self._in_my_game_details_submenu:
-                        self._my_game_details_selected_index = max(0, self._my_game_details_selected_index - 1)
-                        return
-                    self._my_games_filter_focused = True
-                    return
                 self._games_selected_index = games_navigate(self._games_selected_index, "up")
             else:
                 self._set_hub((self.hub_index - 1) % len(self.hubs))
@@ -493,35 +492,23 @@ class DashboardScene:
                     return
                 self._power_selected_index = (self._power_selected_index + 1) % len(self._power_options)
                 return
+            if self._handle_library_shelf_navigation(action):
+                return
             if self._active_hub() == "Home":
                 self._home_move(0, 1)
             elif self._active_hub() == "Settings":
-                if self._in_display_submenu:
-                    max_index = len(self._display_submenu_options()) - 1
-                    self._display_selected_index = min(max_index, self._display_selected_index + 1)
-                elif self._in_art_submenu:
-                    max_index = len(self._art_submenu_options()) - 1
-                    self._display_selected_index = min(max_index, self._display_selected_index + 1)
+                if self._in_display_submenu or self._in_art_submenu:
+                    if self._profile_edit_mode:
+                        return
+                    if self._gamerpic_grid_is_active() and self._gamerpic_grid_nav(0, 1):
+                        return
+                    self._move_settings_submenu_selection(1)
                 elif self._in_system_info_submenu:
                     return
                 else:
                     max_index = self._settings_slot_count() - 1
                     self._settings_selected_index = min(max_index, self._settings_selected_index + 4)
             elif self._active_hub() == "Games":
-                if self._in_my_games_submenu:
-                    if self._my_games_filter_menu_open:
-                        self._my_games_filter_menu_index = (self._my_games_filter_menu_index + 1) % len(
-                            MY_GAMES_FILTERS
-                        )
-                        return
-                    if self._my_games_filter_focused:
-                        self._my_games_filter_focused = False
-                        return
-                    if self._in_my_game_details_submenu:
-                        max_index = len(self._my_game_details_options()) - 1
-                        self._my_game_details_selected_index = min(max_index, self._my_game_details_selected_index + 1)
-                        return
-                    return
                 self._games_selected_index = games_navigate(self._games_selected_index, "down")
             else:
                 self._set_hub((self.hub_index + 1) % len(self.hubs))
@@ -533,7 +520,7 @@ class DashboardScene:
                     return
                 self._apply_power_action(self._power_options[self._power_selected_index])
                 return
-            if self._active_hub() == "Games" and self._in_my_games_submenu and self._my_games_filter_menu_open:
+            if self._library_shelf_active() and self._library_shelf_show_filter_ui() and self._my_games_filter_menu_open:
                 idx = max(0, min(self._my_games_filter_menu_index, len(MY_GAMES_FILTERS) - 1))
                 self._my_games_filter_id = MY_GAMES_FILTERS[idx][0]
                 self._my_games_filter_menu_open = False
@@ -544,15 +531,15 @@ class DashboardScene:
                 )
                 return
             if (
-                self._active_hub() == "Games"
-                and self._in_my_games_submenu
+                self._library_shelf_active()
+                and self._library_shelf_show_filter_ui()
                 and not self._in_my_game_details_submenu
                 and self._my_games_filter_focused
                 and not self._my_games_filter_menu_open
             ):
                 self._open_my_games_filter_menu()
                 return
-            if self._active_hub() == "Games" and self._in_my_games_submenu and self._in_my_game_details_submenu:
+            if self._library_shelf_active() and self._in_my_game_details_submenu:
                 self._apply_my_game_details_action()
                 return
             self._launch_selected()
@@ -560,10 +547,10 @@ class DashboardScene:
             if self._in_power_menu:
                 self._power_transition_target = 0.0
                 return
-            if self._active_hub() == "Games" and self._in_my_games_submenu:
+            if self._library_shelf_active():
                 if self._my_games_loading:
                     self._cancel_my_games_library_load()
-                    self._close_my_games_submenu()
+                    self._close_library_shelf()
                     return
                 if self._my_games_filter_menu_open:
                     self._my_games_filter_menu_open = False
@@ -574,25 +561,34 @@ class DashboardScene:
                 if self._in_my_game_details_submenu:
                     self._close_my_game_details_submenu()
                     return
-                self._close_my_games_submenu()
+                self._close_library_shelf()
                 return
-            if self._active_hub() == "Settings" and (
-                self._in_display_submenu or self._in_system_info_submenu or self._in_art_submenu
-            ):
-                self._in_display_submenu = False
-                self._in_system_info_submenu = False
-                self._in_art_submenu = False
-                self._display_selected_index = 0
-                self._display_transition_target = 0.0
+            if self._active_hub() == "Settings" and self._active_settings_submenu_kind() is not None:
+                if self._in_display_submenu or self._in_art_submenu:
+                    if self._profile_edit_mode:
+                        self._profile_edit_mode = None
+                        self._settings_submenu_focus = "sidebar"
+                        return
+                    if self._gamerpic_grid_engaged:
+                        self._gamerpic_grid_engaged = False
+                        self._settings_submenu_focus = "sidebar"
+                        return
+                    if self._settings_submenu_focus == "panel":
+                        self._settings_submenu_focus = "sidebar"
+                        return
+                self._close_settings_list_submenu()
             else:
                 self.status_text = "At dashboard root."
                 self._status_timer = 1.5
 
     def update(self, dt: float) -> None:
         self.rail.update(dt)
-        if self._steam_input_refresh_pending and self._in_my_games_submenu:
+        if self._steam_input_refresh_pending and self._library_shelf_active():
             self._steam_input_refresh_pending = False
-            self._apply_my_games_filter()
+            if self._library_shelf_kind == "pins":
+                self._apply_my_pins_entries()
+            else:
+                self._apply_my_games_filter()
         if self._display_transition_progress != self._display_transition_target:
             step = dt / max(0.001, self._display_transition_duration_s)
             if self._display_transition_progress < self._display_transition_target:
@@ -605,6 +601,11 @@ class DashboardScene:
                     self._display_transition_target,
                     self._display_transition_progress - step,
                 )
+            if (
+                self._display_transition_progress <= 0.0
+                and self._display_transition_target <= 0.0
+            ):
+                self._last_settings_submenu = None
         if self._status_timer > 0:
             self._status_timer = max(0.0, self._status_timer - dt)
         elif not self.launcher.is_running():
@@ -649,7 +650,7 @@ class DashboardScene:
                     self._my_games_transition_progress - step,
                 )
             if self._my_games_transition_progress <= 0.0 and self._my_games_transition_target <= 0.0:
-                self._in_my_games_submenu = False
+                self._library_shelf_kind = None
                 self._clear_my_games_art_caches()
 
     def render(self, screen: pygame.Surface) -> None:
@@ -677,7 +678,7 @@ class DashboardScene:
         self._hub_rects = []
         for idx, hub in enumerate(self.hubs):
             color = colors["accent"] if idx == self.hub_index else colors["text_dim"]
-            hub_surface = hub_font.render(hub, True, pygame.Color(color))
+            hub_surface = hub_font.render(page_title(hub), True, pygame.Color(color))
             hub_rect = hub_surface.get_rect(topleft=(x, y))
             self._hub_rects.append(hub_rect.inflate(20, 12))
             screen.blit(hub_surface, hub_rect.topleft)
@@ -699,22 +700,20 @@ class DashboardScene:
             screen.blit(from_layer, (from_x, 0))
             screen.blit(to_layer, (to_x, 0))
         else:
-            my_games_overlay = (
-                self._active_hub() == "Games"
-                and (self._in_my_games_submenu or self._my_games_transition_progress > 0.0)
+            shelf_overlay = (
+                (self._library_shelf_active() or self._my_games_transition_progress > 0.0)
                 and not self._hub_transition_active
             )
             skip_hub_under_overlay = (
-                my_games_overlay
-                and self._in_my_games_submenu
+                shelf_overlay
+                and self._library_shelf_active()
                 and self._my_games_transition_progress >= 0.999
             )
             if not skip_hub_under_overlay:
                 self._draw_hub_content(screen, self._active_hub(), use_active_rail=True)
 
         if (
-            self._active_hub() == "Games"
-            and (self._in_my_games_submenu or self._my_games_transition_progress > 0.0)
+            (self._library_shelf_active() or self._my_games_transition_progress > 0.0)
             and not self._hub_transition_active
         ):
             self._draw_my_games_submenu_overlay(screen)
@@ -728,34 +727,38 @@ class DashboardScene:
             self._draw_power_menu(screen)
 
     def _launch_selected(self) -> None:
-        if self._active_hub() == "Games":
-            if self._in_my_games_submenu:
-                if not self._my_games_entries:
-                    return
-                idx = max(0, min(self._my_games_selected_index, len(self._my_games_entries) - 1))
-                tile = self._my_games_entries[idx]
-                try:
-                    self.launcher.launch(tile)
-                    self.status_text = f"Launching: {tile.get('title', 'Unknown')}"
-                except LaunchError as exc:
-                    self.status_text = str(exc)
-                self._status_timer = 2.5
+        if self._library_shelf_active():
+            entries = self._shelf_entries()
+            if not entries:
                 return
+            idx = max(0, min(self._shelf_selected_index(), len(entries) - 1))
+            tile = entries[idx]
+            try:
+                self.launcher.launch(tile)
+                self.status_text = f"Launching: {tile.get('title', 'Unknown')}"
+            except LaunchError as exc:
+                self.status_text = str(exc)
+            self._status_timer = 2.5
+            return
+        if self._active_hub() == "Games":
             if self._games_selected_index == 0:
                 self._open_my_games_submenu()
                 return
             return
         if self._active_hub() == "Home":
             tile = self._home_tiles[self._home_selected_index]
+            tile_action = tile.get("action")
+            if tile_action == "open_my_pins":
+                self._open_my_pins_submenu()
+                return
             if not tile.get("action") and not tile.get("command"):
                 self.status_text = "Home shortcuts are disabled."
                 self._status_timer = 1.2
                 return
         elif self._active_hub() == "Settings":
-            if self._in_display_submenu:
-                tile = self._display_submenu_options()[self._display_selected_index]
-            elif self._in_art_submenu:
-                tile = self._art_submenu_options()[self._display_selected_index]
+            if self._in_display_submenu or self._in_art_submenu:
+                self._handle_settings_submenu_select()
+                return
             elif self._in_system_info_submenu:
                 tile = {"title": "System Information", "action": "open_system_info_submenu"}
             else:
@@ -769,20 +772,23 @@ class DashboardScene:
 
         tile_action = tile.get("action")
         if tile_action == "open_display_submenu":
+            self._enter_settings_submenu("display")
             self._in_display_submenu = True
             self._in_system_info_submenu = False
             self._in_art_submenu = False
-            self._last_settings_submenu = "display"
             self._display_selected_index = 0
-            self._display_transition_target = 1.0
+            self._settings_submenu_focus = "sidebar"
+            self._gamerpic_grid_engaged = False
             return
         if tile_action == "open_art_submenu":
+            self._enter_settings_submenu("personalization")
             self._in_display_submenu = False
             self._in_system_info_submenu = False
             self._in_art_submenu = True
-            self._last_settings_submenu = "personalization"
             self._display_selected_index = 0
-            self._display_transition_target = 1.0
+            self._settings_submenu_focus = "sidebar"
+            self._gamerpic_grid_engaged = False
+            self._profile_edit_mode = None
             return
         if tile_action == "switch_hub":
             target_hub = str(tile.get("hub", "")).strip()
@@ -790,11 +796,10 @@ class DashboardScene:
                 self._set_hub(self.hubs.index(target_hub))
             return
         if tile_action == "open_system_info_submenu":
+            self._enter_settings_submenu("system")
             self._in_display_submenu = False
             self._in_system_info_submenu = True
             self._in_art_submenu = False
-            self._last_settings_submenu = "system"
-            self._display_transition_target = 1.0
             return
         if tile_action == "switch_display":
             if self.on_switch_display is not None:
@@ -807,9 +812,6 @@ class DashboardScene:
             self._power_selected_index = len(self._power_options) - 1
             self._power_transition_progress = 0.0
             self._power_transition_target = 1.0
-            return
-        if tile_action == "scan_game_art":
-            self._start_scan_for_game_art()
             return
         if not tile_action and not tile.get("command"):
             self.status_text = "Not configured yet."
@@ -917,7 +919,7 @@ class DashboardScene:
 
     def _draw_hub_content(self, screen: pygame.Surface, hub_name: str, use_active_rail: bool) -> None:
         if hub_name == "Settings":
-            if self._in_display_submenu or self._in_system_info_submenu or self._in_art_submenu:
+            if self._active_settings_submenu_kind() is not None:
                 self._draw_settings_submenu(screen)
             else:
                 self._draw_settings_panel(screen)
@@ -947,16 +949,22 @@ class DashboardScene:
         self._in_system_info_submenu = False
         self._in_art_submenu = False
         self._last_settings_submenu = None
+        self._settings_submenu_return_index = 0
         self._in_power_menu = False
         self._power_selected_index = 0
         self._power_transition_progress = 0.0
         self._power_transition_target = 0.0
         self._display_selected_index = 0
+        self._settings_submenu_focus = "sidebar"
+        self._gamerpic_grid_engaged = False
+        self._profile_edit_mode = None
         self._display_transition_progress = 0.0
         self._display_transition_target = 0.0
         self._games_selected_index = 0
-        self._in_my_games_submenu = False
+        self._library_shelf_kind = None
         self._my_games_entries = []
+        self._my_pins_entries = []
+        self._my_pins_selected_index = 0
         self._my_games_selected_index = 0
         self._my_games_filter_menu_open = False
         self._my_games_filter_focused = False
@@ -992,7 +1000,7 @@ class DashboardScene:
 
     def _open_my_games_submenu(self) -> None:
         self._close_my_game_details_submenu()
-        self._in_my_games_submenu = True
+        self._library_shelf_kind = "games"
         self._my_games_filter_menu_open = False
         self._my_games_filter_focused = False
         self._my_games_selected_index = 0
@@ -1051,14 +1059,14 @@ class DashboardScene:
             generation = msg[1]
             if generation != self._my_games_library_load_generation:
                 continue
-            if not self._in_my_games_submenu:
+            if not self._library_shelf_active():
                 self._my_games_loading = False
                 continue
             if kind == "err":
                 self._my_games_loading = False
                 self.status_text = f"Could not load games: {msg[2]}"
                 self._status_timer = 3.0
-                self._close_my_games_submenu()
+                self._close_library_shelf()
                 continue
             entries = msg[2]
             self._my_games_master_entries = entries
@@ -1070,12 +1078,229 @@ class DashboardScene:
                 if DashboardScene._game_library_key(game)
             }
             self._my_games_loading = False
-            self._apply_my_games_filter()
+            if self._library_shelf_kind == "pins":
+                self._apply_my_pins_entries()
+            else:
+                self._apply_my_games_filter()
             threading.Thread(target=self._steam_input_backfill_worker, daemon=True).start()
 
     def _close_my_games_submenu(self) -> None:
+        self._close_library_shelf()
+
+    def _close_library_shelf(self) -> None:
         self._close_my_game_details_submenu()
         self._my_games_transition_target = 0.0
+
+    def _open_my_pins_submenu(self) -> None:
+        self._close_my_game_details_submenu()
+        self._library_shelf_kind = "pins"
+        self._my_games_filter_menu_open = False
+        self._my_games_filter_focused = False
+        self._my_pins_selected_index = 0
+        if self._my_games_transition_progress <= 0.0:
+            self._my_games_transition_progress = 0.0
+        self._my_games_transition_target = 1.0
+        self._my_games_art_download_inflight.clear()
+        self._my_games_art_download_failed.clear()
+        self._my_games_art_download_results = queue.SimpleQueue()
+
+        if self._my_games_master_entries:
+            self._my_games_loading = False
+            self._apply_my_pins_entries()
+            return
+
+        self._begin_my_games_library_load()
+
+    def _apply_my_pins_entries(self) -> None:
+        keys = self._pinned_library_keys
+        out: list[dict[str, Any]] = []
+        for g in self._my_games_master_entries:
+            lk = DashboardScene._game_library_key(g)
+            if lk and lk in keys:
+                out.append(g)
+        self._my_pins_entries = out
+        if self._my_pins_selected_index >= len(self._my_pins_entries):
+            self._my_pins_selected_index = max(0, len(self._my_pins_entries) - 1)
+
+    def _library_shelf_show_filter_ui(self) -> bool:
+        return self._library_shelf_kind == "games"
+
+    def _shelf_move_horizontal(self, delta: int) -> None:
+        if self._my_games_filter_menu_open or (
+            self._library_shelf_show_filter_ui() and self._my_games_filter_focused
+        ):
+            return
+        entries = self._shelf_entries()
+        if not entries:
+            return
+        idx = self._shelf_selected_index()
+        self._set_shelf_selected_index(max(0, min(len(entries) - 1, idx + delta)))
+
+    def _handle_library_shelf_navigation(self, action: str) -> bool:
+        """Consume directional input while My Games / My Pins shelf is open."""
+        if not self._library_shelf_active():
+            return False
+
+        if self._in_my_game_details_submenu:
+            if action == "MOVE_UP":
+                self._my_game_details_selected_index = max(0, self._my_game_details_selected_index - 1)
+            elif action == "MOVE_DOWN":
+                max_index = len(self._my_game_details_options()) - 1
+                self._my_game_details_selected_index = min(
+                    max_index, self._my_game_details_selected_index + 1
+                )
+            return True
+
+        show_filter = self._library_shelf_show_filter_ui()
+
+        if action == "MOVE_UP":
+            if show_filter and self._my_games_filter_menu_open:
+                self._my_games_filter_menu_index = (self._my_games_filter_menu_index - 1) % len(
+                    MY_GAMES_FILTERS
+                )
+            elif show_filter:
+                self._my_games_filter_focused = True
+            else:
+                self._shelf_move_horizontal(-1)
+            return True
+
+        if action == "MOVE_DOWN":
+            if show_filter and self._my_games_filter_menu_open:
+                self._my_games_filter_menu_index = (self._my_games_filter_menu_index + 1) % len(
+                    MY_GAMES_FILTERS
+                )
+            elif show_filter and self._my_games_filter_focused:
+                self._my_games_filter_focused = False
+            elif not show_filter:
+                self._shelf_move_horizontal(1)
+            return True
+
+        if action == "MOVE_LEFT":
+            self._shelf_move_horizontal(-1)
+            return True
+
+        if action == "MOVE_RIGHT":
+            self._shelf_move_horizontal(1)
+            return True
+
+        return False
+
+    def _shelf_mouse_hover(self, hover_pos: tuple[int, int]) -> None:
+        if self._in_my_game_details_submenu:
+            return
+        surf = pygame.display.get_surface()
+        if surf is None:
+            return
+        sw, sh = surf.get_size()
+        px, py, pw, ph = self._my_games_popup_screen_rect(sw, sh)
+        lx = hover_pos[0] - px
+        ly = hover_pos[1] - py
+        if not (0 <= lx < pw and 0 <= ly < ph):
+            return
+        show_filter = self._library_shelf_show_filter_ui()
+        layout = compute_my_games_panel_layout(
+            pw,
+            ph,
+            filter_menu_open=self._my_games_filter_menu_open,
+            full_screen=True,
+            show_filter_ui=show_filter,
+        )
+        if show_filter and self._my_games_filter_menu_open:
+            hi_dd = hit_test_my_games_filter_dropdown(lx, ly, layout)
+            if hi_dd is not None:
+                self._my_games_filter_menu_index = hi_dd
+        if show_filter and not self._my_games_filter_menu_open:
+            entries = self._shelf_entries()
+            hi = hit_test_my_games_tile(
+                lx,
+                ly,
+                pw,
+                ph,
+                len(entries),
+                self._shelf_selected_index(),
+                full_screen=True,
+                show_filter_ui=show_filter,
+            )
+            if hi is not None and hi != self._shelf_selected_index():
+                self._set_shelf_selected_index(hi)
+                self._my_games_filter_focused = False
+        elif not show_filter:
+            entries = self._shelf_entries()
+            hi = hit_test_my_games_tile(
+                lx,
+                ly,
+                pw,
+                ph,
+                len(entries),
+                self._shelf_selected_index(),
+                full_screen=True,
+                show_filter_ui=show_filter,
+            )
+            if hi is not None and hi != self._shelf_selected_index():
+                self._set_shelf_selected_index(hi)
+                self._my_games_filter_focused = False
+
+    def _shelf_mouse_click(self, click_pos: tuple[int, int]) -> None:
+        if self._in_my_game_details_submenu:
+            for idx, rect in enumerate(self._my_game_details_option_rects):
+                if rect.collidepoint(click_pos):
+                    self._my_game_details_selected_index = idx
+                    self._apply_my_game_details_action()
+                    break
+            return
+        surf = pygame.display.get_surface()
+        if surf is None:
+            return
+        sw, sh = surf.get_size()
+        px, py, pw, ph = self._my_games_popup_screen_rect(sw, sh)
+        lx = click_pos[0] - px
+        ly = click_pos[1] - py
+        if not (0 <= lx < pw and 0 <= ly < ph):
+            return
+        show_filter = self._library_shelf_show_filter_ui()
+        layout = compute_my_games_panel_layout(
+            pw,
+            ph,
+            filter_menu_open=self._my_games_filter_menu_open,
+            full_screen=True,
+            show_filter_ui=show_filter,
+        )
+        if show_filter and self._my_games_filter_menu_open:
+            dd_idx = hit_test_my_games_filter_dropdown(lx, ly, layout)
+            if dd_idx is not None:
+                self._my_games_filter_id = MY_GAMES_FILTERS[dd_idx][0]
+                self._my_games_filter_menu_open = False
+                self._apply_my_games_filter()
+                self._my_games_selected_index = min(
+                    self._my_games_selected_index,
+                    max(0, len(self._my_games_entries) - 1),
+                )
+                return
+            if hit_test_my_games_filter_button(lx, ly, layout):
+                self._my_games_filter_menu_open = False
+                return
+            self._my_games_filter_menu_open = False
+            self._my_games_filter_focused = False
+            return
+        if show_filter and hit_test_my_games_filter_button(lx, ly, layout):
+            self._my_games_filter_focused = True
+            self._open_my_games_filter_menu()
+            return
+        entries = self._shelf_entries()
+        ci = hit_test_my_games_tile(
+            lx,
+            ly,
+            pw,
+            ph,
+            len(entries),
+            self._shelf_selected_index(),
+            full_screen=True,
+            show_filter_ui=show_filter,
+        )
+        if ci is not None:
+            self._set_shelf_selected_index(ci)
+            self._my_games_filter_focused = False
+            self._launch_selected()
 
     def _my_game_details_options(self) -> list[dict[str, str]]:
         lk = self._my_game_details_library_key or ""
@@ -1084,14 +1309,20 @@ class DashboardScene:
             opts.append({"title": "Show in My Games", "action": "unhide"})
         else:
             opts.append({"title": "Hide from My Games", "action": "hide"})
+        if lk:
+            if lk in self._pinned_library_keys:
+                opts.append({"title": "Unpin from My Pins", "action": "unpin"})
+            else:
+                opts.append({"title": "Pin to My Pins", "action": "pin"})
         opts.append({"title": "Back", "action": "close"})
         return opts
 
     def _open_my_game_details_submenu(self) -> None:
-        if not self._my_games_entries:
+        entries = self._shelf_entries()
+        if not entries:
             return
-        idx = max(0, min(self._my_games_selected_index, len(self._my_games_entries) - 1))
-        game = self._my_games_entries[idx]
+        idx = max(0, min(self._shelf_selected_index(), len(entries) - 1))
+        game = entries[idx]
         lk = DashboardScene._game_library_key(game)
         if not lk:
             return
@@ -1190,6 +1421,24 @@ class DashboardScene:
                     max(0, len(self._my_games_entries) - 1),
                 )
                 self.status_text = "Game restored to My Games."
+                self._status_timer = 2.0
+            return
+        if action == "pin":
+            lk = self._my_game_details_library_key
+            if lk:
+                self._pinned_library_keys.add(lk)
+                save_pinned_library_keys(self._pinned_library_keys)
+                self._apply_my_pins_entries()
+                self.status_text = "Pinned to My Pins."
+                self._status_timer = 2.0
+            return
+        if action == "unpin":
+            lk = self._my_game_details_library_key
+            if lk:
+                self._pinned_library_keys.discard(lk)
+                save_pinned_library_keys(self._pinned_library_keys)
+                self._apply_my_pins_entries()
+                self.status_text = "Unpinned from My Pins."
                 self._status_timer = 2.0
             return
         self._close_my_game_details_submenu()
@@ -2045,9 +2294,9 @@ class DashboardScene:
 
     def _draw_my_games_submenu_overlay(self, screen: pygame.Surface) -> None:
         mix = max(0.0, min(1.0, self._my_games_transition_progress))
-        if mix <= 0.0 and not self._in_my_games_submenu:
+        if mix <= 0.0 and not self._library_shelf_active():
             return
-        if mix <= 0.0 and self._in_my_games_submenu:
+        if mix <= 0.0 and self._library_shelf_active():
             mix = 1.0
 
         width = screen.get_width()
@@ -2085,11 +2334,14 @@ class DashboardScene:
                 full_screen=True,
             )
         else:
+            entries = self._shelf_entries()
+            sel = self._shelf_selected_index()
+            is_pins = self._library_shelf_kind == "pins"
             draw_my_games_submenu(
                 popup_layer,
                 self.theme,
-                self._my_games_entries,
-                self._my_games_selected_index,
+                entries,
+                sel,
                 self._my_games_art_cache,
                 self._ensure_my_games_header,
                 scaled_art_cache=self._my_games_tile_art_scaled,
@@ -2098,6 +2350,13 @@ class DashboardScene:
                 filter_menu_selected_index=self._my_games_filter_menu_index,
                 filter_focused=self._my_games_filter_focused,
                 full_screen=True,
+                shelf_title="my pins" if is_pins else "my games",
+                show_filter_ui=not is_pins,
+                empty_message=(
+                    "Pin games from My Games — press X on a title."
+                    if is_pins
+                    else "No games match this filter."
+                ),
             )
         screen.blit(popup_layer, (panel_x, panel_y))
 
@@ -2141,39 +2400,82 @@ class DashboardScene:
         pygame.draw.rect(screen, pygame.Color("#9fb2b7"), header_rect)
         title_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 30)
         body_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 24)
-        item_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 28)
 
         title = title_font.render(game_title, True, pygame.Color("#ffffff"))
         screen.blit(title, (panel_x + 18, panel_y + (header_h - title.get_height()) // 2))
 
-        desc_heading = "Steam Description" if store == "steam" else "Description"
-        desc_label = body_font.render(desc_heading, True, pygame.Color("#44505a"))
-        screen.blit(desc_label, (panel_x + 20, panel_y + 74))
+        pad_x = 20
+        pad_bottom = 16
+        content_x = panel_x + pad_x
+        content_w = panel_w - 2 * pad_x
+        body_top = panel_y + header_h + 14
 
-        desc_rect = pygame.Rect(panel_x + 20, panel_y + 108, panel_w - 40, int(panel_h * 0.56))
+        desc_heading = "steam description" if store == "steam" else "description"
+        desc_label = body_font.render(desc_heading, True, pygame.Color("#44505a"))
+        screen.blit(desc_label, (content_x, body_top))
+
+        option_count = len(options)
+        option_gap = 4
+        list_gap_above = 14
+        min_row_h = 38
+        max_row_h = 50
+        preferred_row_h = 46 if option_count <= 4 else 40
+        options_block_h = option_count * preferred_row_h + max(0, option_count - 1) * option_gap
+        list_bottom = panel_y + panel_h - pad_bottom
+        list_top = list_bottom - options_block_h
+        row_h = preferred_row_h
+        if list_top < body_top + desc_label.get_height() + 48:
+            list_top = body_top + desc_label.get_height() + 48
+            available = list_bottom - list_top
+            if option_count > 0:
+                row_h = max(
+                    min_row_h,
+                    min(max_row_h, (available - max(0, option_count - 1) * option_gap) // option_count),
+                )
+                options_block_h = option_count * row_h + max(0, option_count - 1) * option_gap
+                list_top = list_bottom - options_block_h
+
+        desc_rect = pygame.Rect(
+            content_x,
+            body_top + desc_label.get_height() + 8,
+            content_w,
+            max(60, list_top - list_gap_above - (body_top + desc_label.get_height() + 8)),
+        )
         pygame.draw.rect(screen, pygame.Color("#e9eef0"), desc_rect)
         pygame.draw.rect(screen, pygame.Color("#ccd5d9"), desc_rect, width=1)
         desc_text = self._my_game_details_description
         if self._my_game_details_loading:
             desc_text = "Loading Steam description..." if store == "steam" else "Loading..."
-        lines = self._wrap_text_lines(desc_text, body_font, desc_rect.w - 24, max_lines=12)
+        line_h = body_font.get_linesize()
+        max_desc_lines = max(1, (desc_rect.h - 16) // line_h)
+        lines = self._wrap_text_lines(desc_text, body_font, desc_rect.w - 24, max_lines=max_desc_lines)
         ty = desc_rect.y + 12
         for line in lines:
+            if ty + line_h > desc_rect.bottom - 6:
+                break
             surf = body_font.render(line, True, pygame.Color("#2e373d"))
             screen.blit(surf, (desc_rect.x + 12, ty))
             ty += surf.get_height() + 6
 
-        row_h = 56
-        list_top = desc_rect.bottom + 22
+        item_font_size = 26 if row_h >= 44 else 22
+        item_font = pygame.font.SysFont(self.theme["typography"]["font_family"], item_font_size)
+        label_pad_x = 14
+        max_label_w = content_w - 2 * label_pad_x
+
         for idx, opt in enumerate(options):
-            row = pygame.Rect(panel_x + 20, list_top + idx * row_h, panel_w - 40, row_h - 4)
+            row_y = list_top + idx * (row_h + option_gap)
+            row = pygame.Rect(content_x, row_y, content_w, row_h)
             self._my_game_details_option_rects.append(row)
             is_sel = idx == self._my_game_details_selected_index
             fill = pygame.Color("#52c425") if is_sel else pygame.Color("#eef2f3")
             fg = pygame.Color("#ffffff") if is_sel else pygame.Color("#465156")
             pygame.draw.rect(screen, fill, row)
-            label = item_font.render(opt["title"], True, fg)
-            screen.blit(label, (row.x + 16, row.y + (row.height - label.get_height()) // 2))
+            label_text = opt["title"]
+            label = item_font.render(label_text, True, fg)
+            while label_text and label.get_width() > max_label_w:
+                label_text = label_text[:-1]
+                label = item_font.render(label_text + "…", True, fg)
+            screen.blit(label, (row.x + label_pad_x, row.y + (row.height - label.get_height()) // 2))
 
     def _draw_games_panel(self, screen: pygame.Surface) -> None:
         self._games_tile_rects = build_slot_rects(screen.get_width(), screen.get_height())
@@ -2265,6 +2567,7 @@ class DashboardScene:
             "Settings": [
                 {
                     "title": "Display",
+                    "icon": "display",
                     "action": "open_display_submenu",
                 },
                 {
@@ -2275,22 +2578,26 @@ class DashboardScene:
                 },
                 {
                     "title": "Sound",
+                    "icon": "sound",
                     "command": "cmd.exe",
                     "args": ["/c", "start ms-settings:sound"],
                     "cwd": "",
                 },
                 {
                     "title": "Network",
+                    "icon": "network",
                     "command": "cmd.exe",
                     "args": ["/c", "start ms-settings:network"],
                     "cwd": "",
                 },
                 {
                     "title": "System",
+                    "icon": "system",
                     "action": "open_system_info_submenu",
                 },
                 {
                     "title": "Personalization",
+                    "icon": "personalization",
                     "action": "open_art_submenu",
                 },
                 {
@@ -2298,6 +2605,7 @@ class DashboardScene:
                 },
                 {
                     "title": "Power",
+                    "icon": "power",
                     "action": "open_power_menu",
                 },
             ],
@@ -2327,15 +2635,407 @@ class DashboardScene:
             },
         ]
 
-    @staticmethod
-    def _art_submenu_options() -> list[dict[str, Any]]:
+    def _art_submenu_options(self) -> list[dict[str, Any]]:
         return [
+            {
+                "title": "Change Gamertag",
+                "action": "edit_gamertag",
+                "description": "Updates your name on the Xbox Guide player tab.",
+            },
+            {
+                "title": "Change Gamerpic",
+                "action": "pick_gamerpic",
+                "description": "Choose an image for the emblem in the Xbox Guide header.",
+            },
             {
                 "title": "Scan for game art",
                 "action": "scan_game_art",
                 "description": "Check Steam first, then SteamGridDB fallback.",
             },
         ]
+
+    def _apply_profile_to_guide(self) -> None:
+        profile = load_profile()
+        pic = gamerpic_absolute(profile.get("gamerpic"))
+        self.guide.set_profile(profile.get("gamertag", DEFAULT_GAMERTAG), pic)
+
+    def _save_gamertag_edit(self) -> None:
+        tag = self._profile_edit_buffer.strip() or DEFAULT_GAMERTAG
+        profile = load_profile()
+        save_profile(tag, profile.get("gamerpic", ""))
+        self._apply_profile_to_guide()
+        self._profile_edit_mode = None
+        self.status_text = f"Gamertag set to {tag}."
+        self._status_timer = 2.0
+
+    def _pick_gamerpic_file(self) -> None:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+        except ImportError:
+            self.status_text = "File picker is not available."
+            self._status_timer = 2.0
+            return
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        root.update()
+        chosen = filedialog.askopenfilename(
+            title="Choose Gamerpic",
+            filetypes=[
+                ("Images", "*.png *.jpg *.jpeg *.bmp *.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        root.destroy()
+        if not chosen:
+            return
+        try:
+            filename = copy_gamerpic_file(Path(chosen))
+        except OSError as exc:
+            self.status_text = f"Could not save gamerpic: {exc}"
+            self._status_timer = 2.5
+            return
+        profile = load_profile()
+        save_profile(profile.get("gamertag", DEFAULT_GAMERTAG), filename)
+        self._apply_profile_to_guide()
+        self._gamerpic_grid_index = 0
+        self.status_text = "Gamerpic updated."
+        self._status_timer = 2.0
+
+    def _enter_settings_submenu(self, kind: str) -> None:
+        self._settings_submenu_return_index = self._settings_selected_index
+        self._last_settings_submenu = kind
+        self._display_transition_target = 1.0
+
+    def _close_settings_list_submenu(self) -> None:
+        self._in_display_submenu = False
+        self._in_system_info_submenu = False
+        self._in_art_submenu = False
+        self._profile_edit_mode = None
+        self._settings_submenu_focus = "sidebar"
+        self._gamerpic_grid_engaged = False
+        self._display_selected_index = 0
+        self._settings_selected_index = self._settings_submenu_return_index
+        self._display_transition_target = 0.0
+
+    def _settings_submenu_transitioning(self) -> bool:
+        if self._active_hub() != "Settings":
+            return False
+        return abs(self._display_transition_progress - self._display_transition_target) > 0.02
+
+    def _active_settings_submenu_kind(self) -> str | None:
+        if self._in_system_info_submenu:
+            return "system"
+        if self._in_art_submenu:
+            return "personalization"
+        if self._in_display_submenu:
+            return "display"
+        if self._display_transition_progress > 0.0 and self._last_settings_submenu:
+            return self._last_settings_submenu
+        return None
+
+    def _move_settings_submenu_selection(self, delta: int) -> None:
+        options = (
+            self._display_submenu_options()
+            if self._in_display_submenu
+            else self._art_submenu_options()
+        )
+        if not options:
+            return
+        max_index = len(options) - 1
+        next_index = max(0, min(max_index, self._display_selected_index + delta))
+        if next_index == self._display_selected_index:
+            return
+        self._display_selected_index = next_index
+        self._leave_gamerpic_grid_if_needed()
+
+    def _leave_gamerpic_grid_if_needed(self) -> None:
+        if self._current_settings_submenu_tile().get("action") == "pick_gamerpic":
+            return
+        self._gamerpic_grid_engaged = False
+        if self._profile_edit_mode != "gamertag":
+            self._settings_submenu_focus = "sidebar"
+
+    def _engage_gamerpic_grid(self) -> None:
+        self._gamerpic_grid_engaged = True
+        self._settings_submenu_focus = "panel"
+        self._sync_gamerpic_grid_index()
+
+    def _gamerpic_grid_is_active(self) -> bool:
+        if not self._in_art_submenu or not self._gamerpic_grid_engaged:
+            return False
+        return self._current_settings_submenu_tile().get("action") == "pick_gamerpic"
+
+    def _current_settings_submenu_tile(self) -> dict[str, Any]:
+        options = (
+            self._display_submenu_options()
+            if self._in_display_submenu
+            else self._art_submenu_options()
+        )
+        idx = max(0, min(self._display_selected_index, len(options) - 1))
+        return options[idx]
+
+    def _settings_submenu_needs_panel(self, tile: dict[str, Any]) -> bool:
+        action = tile.get("action")
+        if action in {"pick_gamerpic", "edit_gamertag"}:
+            return True
+        return bool(tile.get("command")) and action != "switch_display"
+
+    def _handle_settings_submenu_select(self) -> None:
+        tile = self._current_settings_submenu_tile()
+        tile_action = tile.get("action")
+
+        if self._settings_submenu_focus == "sidebar":
+            if tile_action == "pick_gamerpic":
+                if not self._gamerpic_grid_engaged:
+                    self._engage_gamerpic_grid()
+                else:
+                    self._apply_gamerpic_grid_selection()
+                return
+            if self._settings_submenu_needs_panel(tile):
+                self._settings_submenu_focus = "panel"
+                if tile_action == "edit_gamertag":
+                    self._profile_edit_mode = "gamertag"
+                    self._profile_edit_buffer = load_profile().get("gamertag", DEFAULT_GAMERTAG)
+                return
+            if tile_action == "switch_display":
+                if self.on_switch_display is not None:
+                    self.on_switch_display()
+                    self.status_text = "Switched display."
+                    self._status_timer = 2.0
+                return
+            if tile_action == "scan_game_art":
+                self._start_scan_for_game_art()
+                return
+            if tile.get("command"):
+                try:
+                    self.launcher.launch(tile)
+                    self.status_text = f"Launching: {tile.get('title', 'Unknown')}"
+                except LaunchError as exc:
+                    self.status_text = str(exc)
+                self._status_timer = 2.5
+            return
+
+        if tile_action == "edit_gamertag":
+            if self._profile_edit_mode == "gamertag":
+                self._save_gamertag_edit()
+            else:
+                self._profile_edit_mode = "gamertag"
+                self._profile_edit_buffer = load_profile().get("gamertag", DEFAULT_GAMERTAG)
+            return
+        if tile_action == "pick_gamerpic":
+            self._apply_gamerpic_grid_selection()
+            return
+        if tile_action == "switch_display":
+            if self.on_switch_display is not None:
+                self.on_switch_display()
+                self.status_text = "Switched display."
+                self._status_timer = 2.0
+            return
+        if tile_action == "scan_game_art":
+            self._start_scan_for_game_art()
+            return
+        if tile.get("command"):
+            try:
+                self.launcher.launch(tile)
+                self.status_text = f"Launching: {tile.get('title', 'Unknown')}"
+            except LaunchError as exc:
+                self.status_text = str(exc)
+            self._status_timer = 2.5
+
+    def _is_gamerpic_panel_active(self) -> bool:
+        return self._gamerpic_grid_is_active()
+
+    def _gamerpic_grid_dims(self) -> tuple[int, int]:
+        count = len(gamerpic_grid_slots())
+        cols = GAMERPIC_GRID_COLS
+        rows = max(1, (count + cols - 1) // cols)
+        return cols, rows
+
+    def _sync_gamerpic_grid_index(self) -> None:
+        profile_rel = load_profile().get("gamerpic", "").strip()
+        for idx, slot in enumerate(gamerpic_grid_slots()):
+            if slot.get("custom"):
+                if profile_rel == CUSTOM_GAMERPIC_REL:
+                    self._gamerpic_grid_index = idx
+                    return
+                continue
+            if profile_rel and slot.get("rel") == profile_rel:
+                self._gamerpic_grid_index = idx
+                return
+        self._gamerpic_grid_index = 0
+
+    def _gamerpic_grid_nav(self, dx: int, dy: int) -> bool:
+        if not self._gamerpic_grid_is_active():
+            return False
+        slots = gamerpic_grid_slots()
+        if not slots:
+            return False
+        cols, rows = self._gamerpic_grid_dims()
+        row = self._gamerpic_grid_index // cols
+        col = self._gamerpic_grid_index % cols
+        col = max(0, min(cols - 1, col + dx))
+        row = max(0, min(rows - 1, row + dy))
+        new_index = row * cols + col
+        if new_index >= len(slots):
+            new_index = len(slots) - 1
+        self._gamerpic_grid_index = new_index
+        return True
+
+    def _gamerpic_grid_index_at_pos(self, pos: tuple[int, int]) -> int | None:
+        if not self._gamerpic_grid_is_active():
+            return None
+        for idx, rect in enumerate(self._gamerpic_grid_rects):
+            if rect.collidepoint(pos):
+                return idx
+        return None
+
+    def _gamerpic_thumb(self, rel_path: str, size: int) -> pygame.Surface | None:
+        cache_key = f"{rel_path}@{size}"
+        cached = self._gamerpic_thumb_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        path = gamerpic_absolute(rel_path)
+        if path is None:
+            return None
+        try:
+            image = pygame.image.load(str(path)).convert_alpha()
+            thumb = pygame.transform.smoothscale(image, (size, size))
+            self._gamerpic_thumb_cache[cache_key] = thumb
+            return thumb
+        except (pygame.error, FileNotFoundError):
+            return None
+
+    def _apply_gamerpic_grid_selection(self) -> None:
+        slots = gamerpic_grid_slots()
+        if not slots or self._gamerpic_grid_index >= len(slots):
+            return
+        slot = slots[self._gamerpic_grid_index]
+        if slot.get("custom"):
+            self._pick_gamerpic_file()
+            return
+        rel = str(slot.get("rel", "")).strip()
+        if not rel:
+            return
+        profile = load_profile()
+        save_profile(profile.get("gamertag", DEFAULT_GAMERTAG), rel)
+        self._apply_profile_to_guide()
+        self.status_text = "Gamerpic updated."
+        self._status_timer = 2.0
+
+    @staticmethod
+    def _draw_controller_selection_box(
+        screen: pygame.Surface,
+        rect: pygame.Rect,
+        *,
+        pulse: bool = True,
+    ) -> None:
+        """Xbox-style focus ring for controller-driven grid selection."""
+        pad = 5
+        frame = rect.inflate(pad * 2, pad * 2)
+        accent = pygame.Color(79, 203, 37)
+        glow = pygame.Color(120, 220, 80, 90)
+        if pulse:
+            t = pygame.time.get_ticks() / 1000.0
+            pad += int(2 * (0.5 + 0.5 * math.sin(t * 4.0)))
+            frame = rect.inflate(pad * 2, pad * 2)
+        glow_surf = pygame.Surface(frame.size, pygame.SRCALPHA)
+        pygame.draw.rect(glow_surf, glow, glow_surf.get_rect(), border_radius=4)
+        screen.blit(glow_surf, frame.topleft)
+        pygame.draw.rect(screen, accent, frame, 3, border_radius=2)
+        inner = frame.inflate(-6, -6)
+        pygame.draw.rect(screen, pygame.Color(255, 255, 255), inner, 1, border_radius=1)
+        corner = max(8, min(14, frame.width // 5))
+        for ox, oy, dx, dy in (
+            (frame.left, frame.top, 1, 1),
+            (frame.right, frame.top, -1, 1),
+            (frame.left, frame.bottom, 1, -1),
+            (frame.right, frame.bottom, -1, -1),
+        ):
+            cx = ox if dx > 0 else ox - 1
+            cy = oy if dy > 0 else oy - 1
+            pygame.draw.line(screen, accent, (cx, cy), (cx + dx * corner, cy), 3)
+            pygame.draw.line(screen, accent, (cx, cy), (cx, cy + dy * corner), 3)
+
+    def _draw_gamerpic_grid(
+        self,
+        screen: pygame.Surface,
+        panel: pygame.Rect,
+        colors: dict[str, Any],
+        body_font: pygame.font.Font,
+        small_font: pygame.font.Font,
+    ) -> None:
+        slots = gamerpic_grid_slots()
+        self._gamerpic_grid_rects = []
+        if not slots:
+            msg = body_font.render("No gamerpics found.", True, pygame.Color(colors["text"]))
+            screen.blit(msg, (panel.x + 16, panel.y + 16))
+            return
+
+        cols, _rows = self._gamerpic_grid_dims()
+        pad = 10
+        gap = 8
+
+        heading = body_font.render(page_title("Choose Gamerpic"), True, pygame.Color(colors["text"]))
+        heading_y = panel.y + pad
+        screen.blit(heading, (panel.x + pad, heading_y))
+        grid_top = heading_y + heading.get_height() + pad + 4
+
+        usable_w = panel.width - pad * 2
+        usable_h = panel.height - (grid_top - panel.y) - pad - 28
+        cell = max(48, min((usable_w - gap * (cols - 1)) // cols, (usable_h - gap * 2) // 3))
+        grid_w = cols * cell + gap * (cols - 1)
+        start_x = panel.x + pad + max(0, (usable_w - grid_w) // 2)
+        start_y = grid_top
+
+        profile_rel = load_profile().get("gamerpic", "").strip()
+        panel_active = self._is_gamerpic_panel_active()
+        focus_rect: pygame.Rect | None = None
+        for idx, slot in enumerate(slots):
+            row = idx // cols
+            col = idx % cols
+            rect = pygame.Rect(
+                start_x + col * (cell + gap),
+                start_y + row * (cell + gap),
+                cell,
+                cell,
+            )
+            self._gamerpic_grid_rects.append(rect)
+            is_cursor = idx == self._gamerpic_grid_index and panel_active
+            if is_cursor:
+                focus_rect = rect
+            rel = str(slot.get("rel", "")).strip()
+            is_applied = bool(rel and profile_rel == rel)
+            fill = pygame.Color("#2a3840")
+            pygame.draw.rect(screen, fill, rect)
+            if slot.get("custom"):
+                plus = body_font.render("+", True, pygame.Color("#d8e8f0"))
+                screen.blit(plus, plus.get_rect(center=rect.center).topleft)
+                label = small_font.render("Custom", True, pygame.Color("#b8c8d0"))
+                screen.blit(label, (rect.x + 4, rect.bottom - label.get_height() - 4))
+            else:
+                thumb = self._gamerpic_thumb(rel, cell - 6)
+                if thumb is not None:
+                    inner = thumb.get_rect(center=rect.center)
+                    screen.blit(thumb, inner.topleft)
+            border_color = pygame.Color("#5a6a72")
+            border_w = 1
+            if is_applied:
+                border_color = pygame.Color("#88c848")
+                border_w = 2
+            pygame.draw.rect(screen, border_color, rect, border_w)
+
+        if focus_rect is not None:
+            self._draw_controller_selection_box(screen, focus_rect)
+
+        hint = small_font.render(
+            "A: apply   D-pad: move   B: menu",
+            True,
+            pygame.Color(colors.get("text_dim", colors["text"])),
+        )
+        screen.blit(hint, (panel.x + pad, panel.bottom - hint.get_height() - 8))
 
     @staticmethod
     def _build_home_tiles() -> list[dict[str, Any]]:
@@ -2350,7 +3050,15 @@ class DashboardScene:
                 "args": [],
                 "cwd": "",
             },
-            {"title": "My Pins", "col": 0, "row": 1, "w": 1, "h": 1},
+            {
+                "title": "My Pins",
+                "icon": "my_pins",
+                "col": 0,
+                "row": 1,
+                "w": 1,
+                "h": 1,
+                "action": "open_my_pins",
+            },
             {"title": "Recent", "col": 0, "row": 2, "w": 1, "h": 1},
             {
                 "title": "Games with Gold",
@@ -2358,16 +3066,33 @@ class DashboardScene:
                 "row": 0,
                 "w": 2,
                 "h": 2,
-                "hero": True,
                 "command": "cmd.exe",
                 "args": ["/c", "start", "", "steam://store"],
                 "cwd": "",
             },
             {"title": "Search", "col": 3, "row": 0, "w": 1, "h": 1},
-            {"title": "Browse Apps", "col": 3, "row": 1, "w": 1, "h": 1},
+            {"title": "Browse Apps", "icon": "browse_apps", "col": 3, "row": 1, "w": 1, "h": 1},
             {"title": "Demos", "col": 1, "row": 2, "w": 1, "h": 1},
-            {"title": "My Apps", "col": 2, "row": 2, "w": 1, "h": 1, "action": "switch_hub", "hub": "Apps"},
-            {"title": "My Games", "col": 3, "row": 2, "w": 1, "h": 1, "action": "switch_hub", "hub": "Games"},
+            {
+                "title": "My Apps",
+                "icon": "my_apps",
+                "col": 2,
+                "row": 2,
+                "w": 1,
+                "h": 1,
+                "action": "switch_hub",
+                "hub": "Apps",
+            },
+            {
+                "title": "My Games",
+                "icon": "my_games",
+                "col": 3,
+                "row": 2,
+                "w": 1,
+                "h": 1,
+                "action": "switch_hub",
+                "hub": "Games",
+            },
         ]
 
     def _draw_settings_panel(self, screen: pygame.Surface) -> None:
@@ -2441,7 +3166,17 @@ class DashboardScene:
                 else:
                     pygame.draw.rect(screen, accent, draw_rect, width=focus_border)
 
-            label = font.render(tile.get("title", "Untitled"), True, text_color)
+            label = font.render(page_title(tile.get("title", "Untitled")), True, text_color)
+            label_reserve = label.get_height() + pad + 4
+            draw_tile_icon(
+                screen,
+                draw_rect,
+                tile.get("icon"),
+                label_bottom_reserve=label_reserve,
+                icon_set="settings",
+                width_ratio=0.62,
+                top_ratio=0.10,
+            )
             screen.blit(label, (draw_rect.x + pad, draw_rect.bottom - label.get_height() - pad))
 
     def _settings_index_at_pos(self, pos: tuple[int, int]) -> int | None:
@@ -2518,10 +3253,7 @@ class DashboardScene:
             )
             self._home_tile_rects.append(rect)
             is_selected = idx == self._home_selected_index
-            if tile.get("hero"):
-                fill = pygame.Color("#111111")
-            else:
-                fill = pygame.Color("#7BDE57" if is_selected else "#4FCB25")
+            fill = pygame.Color("#7BDE57" if is_selected else "#4FCB25")
             pygame.draw.rect(screen, fill, rect)
             if is_selected:
                 pygame.draw.rect(
@@ -2531,8 +3263,15 @@ class DashboardScene:
                     width=focus_border,
                 )
             font = pygame.font.SysFont(self.theme["typography"]["font_family"], label_px)
-            label = font.render(tile["title"], True, pygame.Color("#f3f6ff"))
-            screen.blit(label, (rect.x + 10, rect.bottom - label.get_height() - 10))
+            label = font.render(page_title(tile["title"]), True, pygame.Color("#f3f6ff"))
+            label_y = rect.bottom - label.get_height() - 10
+            draw_home_tile_icon(
+                screen,
+                rect,
+                tile.get("icon"),
+                label_bottom_reserve=label.get_height() + 14,
+            )
+            screen.blit(label, (rect.x + 10, label_y))
 
     def _draw_display_submenu(self, screen: pygame.Surface, alpha: int = 255) -> None:
         if alpha >= 255:
@@ -2553,13 +3292,14 @@ class DashboardScene:
         screen.blit(layer, (0, 0))
 
     def _draw_settings_submenu_content(self, screen: pygame.Surface) -> None:
-        if self._in_system_info_submenu or self._last_settings_submenu == "system":
+        kind = self._active_settings_submenu_kind()
+        if kind == "system":
             self._draw_system_info_submenu_content(screen)
             return
-        if self._in_art_submenu or self._last_settings_submenu == "personalization":
+        if kind == "personalization":
             self._draw_art_submenu_content(screen)
             return
-        if self._in_display_submenu or self._last_settings_submenu == "display":
+        if kind == "display":
             self._draw_display_submenu_content(screen)
 
     def _draw_art_submenu_content(self, screen: pygame.Surface) -> None:
@@ -2579,8 +3319,9 @@ class DashboardScene:
         title_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 50)
         item_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 38)
         body_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 30)
+        dim_color = pygame.Color(colors.get("text_dim", colors["text"]))
 
-        title = title_font.render("Personalization", True, pygame.Color(colors["text"]))
+        title = title_font.render(page_title("Personalization"), True, pygame.Color(colors["text"]))
         screen.blit(title, (left_x, 70))
 
         right_panel = pygame.Rect(right_x, panel_y, right_w, panel_h)
@@ -2588,17 +3329,86 @@ class DashboardScene:
         panel_bg.fill((28, 40, 48, 185))
         screen.blit(panel_bg, right_panel.topleft)
 
-        row_h = panel_h // 6
+        grid_active = self._gamerpic_grid_is_active()
+        row_h = max(72, panel_h // max(len(options), 1))
         for idx, option in enumerate(options):
             rect = pygame.Rect(left_x, panel_y + idx * row_h, left_w, row_h)
             self._display_option_rects.append(rect)
-            is_selected = idx == self._display_selected_index
-            fill = pygame.Color("#4FCB25") if is_selected else pygame.Color("#f2f5f2")
-            text_color = pygame.Color("#ffffff" if is_selected else "#1f2b24")
+            is_row = idx == self._display_selected_index
+            if is_row and grid_active:
+                fill = pygame.Color("#7cb868")
+                text_color = pygame.Color("#1f2b24")
+            elif is_row:
+                fill = pygame.Color("#4FCB25")
+                text_color = pygame.Color("#ffffff")
+            else:
+                fill = pygame.Color("#f2f5f2")
+                text_color = pygame.Color("#1f2b24")
             pygame.draw.rect(screen, fill, rect)
             pygame.draw.line(screen, pygame.Color("#d4d9d6"), (rect.x, rect.bottom), (rect.right, rect.bottom), 1)
-            label = item_font.render(option["title"], True, text_color)
+            label = item_font.render(page_title(option["title"]), True, text_color)
             screen.blit(label, (rect.x + 20, rect.y + (row_h - label.get_height()) // 2))
+
+        hint_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 24)
+        if grid_active:
+            hint = hint_font.render("B: back to menu", True, dim_color)
+        else:
+            hint = hint_font.render("Up/Down: move   A: open", True, dim_color)
+        screen.blit(hint, (left_x, panel_y + len(options) * row_h + 8))
+
+        info_x = right_x + 22
+        info_y = panel_y + 24
+        selected = options[self._display_selected_index]
+
+        if self._profile_edit_mode == "gamertag":
+            heading = body_font.render(page_title("Edit Gamertag"), True, pygame.Color(colors["text"]))
+            screen.blit(heading, (info_x, info_y))
+            info_y += 48
+            display_text = self._profile_edit_buffer or DEFAULT_GAMERTAG
+            if int(pygame.time.get_ticks() / 500) % 2 == 0:
+                display_text += "|"
+            value = body_font.render(display_text, True, pygame.Color(colors["text"]))
+            screen.blit(value, (info_x, info_y))
+            info_y += 56
+            for line in (
+                "Type on keyboard, then press Enter or A to save.",
+                f"Max {MAX_GAMERTAG_LEN} characters. B cancels.",
+            ):
+                surf = body_font.render(line, True, dim_color)
+                screen.blit(surf, (info_x, info_y))
+                info_y += 40
+            return
+
+        if selected.get("action") == "edit_gamertag":
+            profile = load_profile()
+            tag = profile.get("gamertag", DEFAULT_GAMERTAG)
+            heading = body_font.render(page_title("Current Gamertag"), True, pygame.Color(colors["text"]))
+            screen.blit(heading, (info_x, info_y))
+            info_y += 48
+            screen.blit(body_font.render(tag, True, pygame.Color(colors["text"])), (info_x, info_y))
+            info_y += 56
+            if self._profile_edit_mode == "gamertag":
+                screen.blit(
+                    body_font.render("Type on keyboard. A saves. B returns to menu.", True, dim_color),
+                    (info_x, info_y),
+                )
+            else:
+                screen.blit(
+                    body_font.render("Press A to edit gamertag.", True, dim_color),
+                    (info_x, info_y),
+                )
+            return
+
+        if selected.get("action") == "pick_gamerpic":
+            small_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 22)
+            self._draw_gamerpic_grid(screen, right_panel, colors, body_font, small_font)
+            if not self._gamerpic_grid_is_active():
+                veil = pygame.Surface(right_panel.size, pygame.SRCALPHA)
+                veil.fill((12, 20, 28, 120))
+                screen.blit(veil, right_panel.topleft)
+                lock_hint = small_font.render("Press A to choose a gamerpic", True, pygame.Color("#e8f0f4"))
+                screen.blit(lock_hint, lock_hint.get_rect(center=right_panel.center).topleft)
+            return
 
         total = max(0, self._game_art_scan_total)
         completed = max(0, min(self._game_art_scan_completed, total)) if total > 0 else 0
@@ -2612,10 +3422,9 @@ class DashboardScene:
             f"Applied to cache: {self._game_art_scan_applied}",
             f"Failed to resolve: {self._game_art_scan_failed}",
         ]
-        info_y = panel_y + 24
         for line in lines:
             surf = body_font.render(line, True, pygame.Color(colors["text"]))
-            screen.blit(surf, (right_x + 22, info_y))
+            screen.blit(surf, (info_x, info_y))
             info_y += 52
 
     def _draw_display_submenu_content(self, screen: pygame.Surface) -> None:
@@ -2636,7 +3445,7 @@ class DashboardScene:
         item_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 38)
         body_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 32)
 
-        title = title_font.render("Display", True, pygame.Color(colors["text"]))
+        title = title_font.render(page_title("Display"), True, pygame.Color(colors["text"]))
         screen.blit(title, (left_x, 70))
 
         right_panel = pygame.Rect(right_x, panel_y, right_w, panel_h)
@@ -2644,27 +3453,38 @@ class DashboardScene:
         panel_bg.fill((28, 40, 48, 180))
         screen.blit(panel_bg, right_panel.topleft)
 
-        row_h = panel_h // 6
+        dim_color = pygame.Color(colors.get("text_dim", colors["text"]))
+        row_h = panel_h // max(len(options), 1)
         for idx, option in enumerate(options):
             rect = pygame.Rect(left_x, panel_y + idx * row_h, left_w, row_h)
             self._display_option_rects.append(rect)
-            is_selected = idx == self._display_selected_index
-
-            fill = pygame.Color("#4FCB25") if is_selected else pygame.Color("#f2f5f2")
-            text_color = pygame.Color("#ffffff" if is_selected else "#1f2b24")
+            is_row = idx == self._display_selected_index
+            if is_row:
+                fill = pygame.Color("#4FCB25")
+                text_color = pygame.Color("#ffffff")
+            else:
+                fill = pygame.Color("#f2f5f2")
+                text_color = pygame.Color("#1f2b24")
             pygame.draw.rect(screen, fill, rect)
             pygame.draw.line(screen, pygame.Color("#d4d9d6"), (rect.x, rect.bottom), (rect.right, rect.bottom), 1)
 
-            label = item_font.render(option["title"], True, text_color)
+            label = item_font.render(page_title(option["title"]), True, text_color)
             screen.blit(label, (rect.x + 20, rect.y + (row_h - label.get_height()) // 2))
 
+        hint_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 24)
+        hint = hint_font.render("Up/Down: move   A: select", True, dim_color)
+        screen.blit(hint, (left_x, panel_y + len(options) * row_h + 8))
+
         selected = options[self._display_selected_index]
-        detail_title = body_font.render("Current Option", True, pygame.Color(colors["text"]))
-        detail_body = body_font.render(selected["title"], True, pygame.Color(colors["text"]))
-        detail_desc = body_font.render(selected.get("description", ""), True, pygame.Color(colors["text_dim"]))
+        detail_title = body_font.render(page_title("Current Option"), True, pygame.Color(colors["text"]))
+        detail_body = body_font.render(page_title(selected["title"]), True, pygame.Color(colors["text"]))
+        detail_desc = body_font.render(selected.get("description", ""), True, dim_color)
         screen.blit(detail_title, (right_x + 22, panel_y + 24))
         screen.blit(detail_body, (right_x + 22, panel_y + 84))
         screen.blit(detail_desc, (right_x + 22, panel_y + 150))
+        if selected.get("command"):
+            action_hint = body_font.render("Press A to run.", True, dim_color)
+            screen.blit(action_hint, (right_x + 22, panel_y + 220))
 
     def _draw_system_info_submenu_content(self, screen: pygame.Surface) -> None:
         colors = self.theme["colors"]
@@ -2681,7 +3501,7 @@ class DashboardScene:
         item_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 34)
         value_font = pygame.font.SysFont(self.theme["typography"]["font_family"], 30)
 
-        title = title_font.render("System Information", True, pygame.Color(colors["text"]))
+        title = title_font.render(page_title("System Information"), True, pygame.Color(colors["text"]))
         screen.blit(title, (panel_x, 70))
 
         panel_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
@@ -2885,7 +3705,7 @@ class DashboardScene:
         icon_q = icon_font.render("?", True, pygame.Color("#ffffff"))
         icon_rect = icon_q.get_rect(center=(panel_x + 18, panel_y + 24))
         screen.blit(icon_q, icon_rect.topleft)
-        title = title_font.render("Power", True, pygame.Color("#ffffff"))
+        title = title_font.render(page_title("Power"), True, pygame.Color("#ffffff"))
         title_rect = title.get_rect(midleft=(panel_x + 36, panel_y + (header_h // 2)))
         screen.blit(title, title_rect.topleft)
 

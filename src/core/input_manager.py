@@ -13,35 +13,55 @@ except ImportError:  # pragma: no cover
 
 @dataclass(frozen=True)
 class InputConfig:
-    stick_deadzone: float = 0.35
-    repeat_cooldown_s: float = 0.16
+    stick_deadzone: float = 0.20
+    stick_release_deadzone: float = 0.10
+    stick_direction_threshold: float = 0.12
+    stick_repeat_initial_s: float = 0.20
+    stick_repeat_interval_s: float = 0.09
 
 
 class InputManager:
     def __init__(self, config: InputConfig | None = None) -> None:
         self.config = config or InputConfig()
         self._controllers: dict[int, Any] = {}
-        self._cooldown = 0.0
+        self._joysticks: dict[int, pygame.joystick.Joystick] = {}
         self._synthetic_actions: list[str] = []
         self._prev_lb = False
         self._prev_rb = False
         self._prev_start = False
+        self._using_controller = False
+        self._stick_engaged = False
+        self._stick_digital: tuple[int, int] = (0, 0)
+        self._stick_hold_s = 0.0
+        self._stick_repeat_timer = 0.0
+
+    @property
+    def mouse_enabled(self) -> bool:
+        return not self._using_controller
+
+    @property
+    def using_controller(self) -> bool:
+        return self._using_controller
+
+    def has_controllers(self) -> bool:
+        return bool(self._controllers or self._joysticks)
 
     def initialize(self) -> None:
         pygame.joystick.init()
-        if sdl_controller is None:
-            return
-        sdl_controller.init()
-        for idx in range(sdl_controller.get_count()):
-            self._try_add_controller(idx)
+        if sdl_controller is not None:
+            sdl_controller.init()
+            for idx in range(sdl_controller.get_count()):
+                self._try_add_controller(idx)
+        if not self._controllers:
+            self._refresh_joysticks()
 
     def update(self, dt: float) -> None:
-        self._cooldown = max(0.0, self._cooldown - dt)
         self._synthetic_actions.clear()
-        if not self._controllers:
+        if not self.has_controllers():
             self._prev_lb = False
             self._prev_rb = False
             self._prev_start = False
+            self._reset_stick_navigation()
             return
 
         lb_pressed, rb_pressed, start_pressed = self._aggregate_controller_state()
@@ -52,13 +72,17 @@ class InputManager:
             self._synthetic_actions.append("EXIT_TO_DESKTOP")
         elif not exit_combo and not start_pressed:
             if lb_pressed and not self._prev_lb:
+                self._mark_controller_active()
                 self._synthetic_actions.append("HUB_PREV")
             if rb_pressed and not self._prev_rb:
+                self._mark_controller_active()
                 self._synthetic_actions.append("HUB_NEXT")
 
         self._prev_lb = lb_pressed
         self._prev_rb = rb_pressed
         self._prev_start = start_pressed
+
+        self._poll_stick_navigation(dt)
 
     def consume_synthetic_actions(self) -> list[str]:
         out = list(self._synthetic_actions)
@@ -66,12 +90,44 @@ class InputManager:
         return out
 
     def handle_device_event(self, event: pygame.event.Event) -> None:
-        if sdl_controller is None:
-            return
         if event.type == pygame.CONTROLLERDEVICEADDED:
-            self._try_add_controller(event.device_index)
+            if sdl_controller is not None:
+                self._try_add_controller(event.device_index)
+                if self._controllers:
+                    self._joysticks.clear()
         elif event.type == pygame.CONTROLLERDEVICEREMOVED:
             self._controllers.pop(event.instance_id, None)
+            if not self._controllers:
+                self._refresh_joysticks()
+            if not self.has_controllers():
+                self._using_controller = False
+                self._reset_stick_navigation()
+        elif event.type in (pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED):
+            if not self._controllers:
+                self._refresh_joysticks()
+            if not self.has_controllers():
+                self._using_controller = False
+                self._reset_stick_navigation()
+
+    def _refresh_joysticks(self) -> None:
+        self._joysticks.clear()
+        for idx in range(pygame.joystick.get_count()):
+            stick = pygame.joystick.Joystick(idx)
+            if not stick.get_init():
+                stick.init()
+            self._joysticks[idx] = stick
+
+    def _reset_stick_navigation(self) -> None:
+        self._stick_engaged = False
+        self._stick_digital = (0, 0)
+        self._stick_hold_s = 0.0
+        self._stick_repeat_timer = 0.0
+
+    def _mark_controller_active(self) -> None:
+        self._using_controller = True
+
+    def _mark_mouse_active(self) -> None:
+        self._using_controller = False
 
     def actions_from_event(self, event: pygame.event.Event) -> list[str]:
         actions: list[str] = []
@@ -91,6 +147,10 @@ class InputManager:
             elif event.key == pygame.K_x:
                 actions.append("DETAILS")
 
+        if event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
+            if self._using_controller:
+                self._mark_mouse_active()
+
         if event.type == pygame.MOUSEMOTION:
             x, y = event.pos
             actions.append(f"MOUSE_HOVER:{x}:{y}")
@@ -100,6 +160,7 @@ class InputManager:
             actions.append(f"MOUSE_CLICK:{x}:{y}")
 
         if event.type == pygame.CONTROLLERBUTTONDOWN:
+            self._mark_controller_active()
             if event.button == pygame.CONTROLLER_BUTTON_A:
                 actions.append("SELECT")
             elif event.button == pygame.CONTROLLER_BUTTON_B:
@@ -119,25 +180,109 @@ class InputManager:
             elif event.button == getattr(pygame, "CONTROLLER_BUTTON_GUIDE", 16):
                 actions.append("TOGGLE_GUIDE")
 
-        if (
-            event.type == pygame.CONTROLLERAXISMOTION
-            and self._cooldown <= 0.0
-            and abs(event.value) >= self.config.stick_deadzone
-        ):
-            if event.axis == pygame.CONTROLLER_AXIS_LEFTX:
-                actions.append("MOVE_RIGHT" if event.value > 0 else "MOVE_LEFT")
-                self._cooldown = self.config.repeat_cooldown_s
-            elif event.axis == pygame.CONTROLLER_AXIS_LEFTY:
-                actions.append("MOVE_DOWN" if event.value > 0 else "MOVE_UP")
-                self._cooldown = self.config.repeat_cooldown_s
+        if event.type in (pygame.CONTROLLERAXISMOTION, pygame.JOYAXISMOTION):
+            self._mark_controller_active()
+
+        if event.type == pygame.JOYBUTTONDOWN:
+            self._mark_controller_active()
 
         return actions
+
+    def _poll_stick_navigation(self, dt: float) -> None:
+        x, y = self._left_stick_normalized()
+        magnitude = max(abs(x), abs(y))
+        cfg = self.config
+
+        if magnitude < cfg.stick_release_deadzone:
+            self._reset_stick_navigation()
+            return
+
+        if not self._stick_engaged:
+            if magnitude < cfg.stick_deadzone:
+                return
+            digital = self._stick_to_digital(x, y)
+            if digital == (0, 0):
+                return
+            action = self._action_for_stick_digital(digital)
+            if action is None:
+                return
+            self._mark_controller_active()
+            self._stick_engaged = True
+            self._stick_digital = digital
+            self._stick_hold_s = 0.0
+            self._stick_repeat_timer = 0.0
+            self._synthetic_actions.append(action)
+            return
+
+        action = self._action_for_stick_digital(self._stick_digital)
+        if action is None:
+            return
+
+        self._mark_controller_active()
+        self._stick_hold_s += dt
+        self._stick_repeat_timer = max(0.0, self._stick_repeat_timer - dt)
+        if (
+            self._stick_hold_s >= cfg.stick_repeat_initial_s
+            and self._stick_repeat_timer <= 0.0
+        ):
+            self._stick_repeat_timer = cfg.stick_repeat_interval_s
+            self._synthetic_actions.append(action)
+
+    @staticmethod
+    def _normalize_axis(value: float) -> float:
+        if abs(value) > 1.0:
+            return max(-1.0, min(1.0, value / 32767.0))
+        return max(-1.0, min(1.0, value))
+
+    def _left_stick_normalized(self) -> tuple[float, float]:
+        if self._controllers:
+            sx = 0.0
+            sy = 0.0
+            count = 0
+            for ctl in self._controllers.values():
+                sx += self._normalize_axis(float(ctl.get_axis(pygame.CONTROLLER_AXIS_LEFTX)))
+                sy += self._normalize_axis(float(ctl.get_axis(pygame.CONTROLLER_AXIS_LEFTY)))
+                count += 1
+            return sx / count, sy / count
+
+        for stick in self._joysticks.values():
+            if stick.get_numaxes() < 2:
+                continue
+            return (
+                self._normalize_axis(float(stick.get_axis(0))),
+                self._normalize_axis(float(stick.get_axis(1))),
+            )
+        return 0.0, 0.0
+
+    def _stick_to_digital(self, x: float, y: float) -> tuple[int, int]:
+        dz = self.config.stick_direction_threshold
+        ax = abs(x)
+        ay = abs(y)
+        if ax < dz and ay < dz:
+            return (0, 0)
+        if ax >= ay:
+            return (1 if x > 0 else -1, 0)
+        return (0, 1 if y > 0 else -1)
+
+    @staticmethod
+    def _action_for_stick_digital(digital: tuple[int, int]) -> str | None:
+        dx, dy = digital
+        if dx > 0:
+            return "MOVE_RIGHT"
+        if dx < 0:
+            return "MOVE_LEFT"
+        if dy > 0:
+            return "MOVE_DOWN"
+        if dy < 0:
+            return "MOVE_UP"
+        return None
 
     def _try_add_controller(self, device_index: int) -> None:
         if sdl_controller is None or not sdl_controller.is_controller(device_index):
             return
         controller = sdl_controller.Controller(device_index)
         self._controllers[controller.as_joystick().get_instance_id()] = controller
+        self._joysticks.clear()
 
     def _aggregate_controller_state(self) -> tuple[bool, bool, bool]:
         lb = False

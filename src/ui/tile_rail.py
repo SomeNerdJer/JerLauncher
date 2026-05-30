@@ -4,6 +4,8 @@ from typing import Any
 
 import pygame
 
+from ui.page_text import page_title
+
 
 class TileRail:
     def __init__(self, tiles: list[dict[str, Any]], theme: dict[str, Any]) -> None:
@@ -76,5 +78,5 @@ class TileRail:
                     border_radius=6,
                 )
 
-            label = font.render(tile.get("title", "Untitled"), True, text_color)
+            label = font.render(page_title(tile.get("title", "Untitled")), True, text_color)
             screen.blit(label, (x + 14, y + tile_h - label.get_height() - 14))
