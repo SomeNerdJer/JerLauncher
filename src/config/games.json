@@ -1,0 +1,23 @@
+[
+  {
+    "title": "Notepad Test",
+    "command": "notepad.exe",
+    "args": [],
+    "cwd": ""
+  },
+  {
+    "title": "Calculator",
+    "command": "calc.exe",
+    "args": [],
+    "cwd": ""
+  },
+  {
+    "title": "Command Prompt",
+    "command": "cmd.exe",
+    "args": [
+      "/c",
+      "start"
+    ],
+    "cwd": ""
+  }
+]

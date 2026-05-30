@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.env
+.env.*
+Thumbs.db
+desktop.ini
+
+# Local runtime / user state
+src/config/display_state.json
+
+# Optional: uncomment to keep art cache out of git
+# assets/cache/
