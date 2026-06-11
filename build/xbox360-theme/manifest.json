@@ -1,0 +1,6 @@
+{
+  "id": "xbox360",
+  "name": "Xbox 360 Metro",
+  "version": "1.0.0",
+  "module": "themes.xbox360"
+}

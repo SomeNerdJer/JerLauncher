@@ -9,70 +9,148 @@ from typing import Any
 import pygame
 
 from core.input_manager import InputManager
-from core.page_sounds import init_page_sounds
 from core.scene_manager import SceneManager
+from core.theme_context import ThemePackage, set_active
+from core.theme_loader import ThemeLoadError, load_theme_zip
 from services.launcher import Launcher
-from ui.boot_scene import BootScene
-from ui.dashboard_scene import DashboardScene
+from themes.registry import load_theme_module
+from ui.core_scene import CoreScene
+from ui.theme_picker import pick_theme_zip
 
 
-class MetroApp:
+class GameLauncherApp:
     def __init__(self) -> None:
         self.root = Path(__file__).resolve().parents[1]
         self.project_root = self.root.parent
-        self.theme = self._load_json(self.root / "config" / "theme.json")
         self.games = self._load_json(self.root / "config" / "games.json")
-        self.state_path = self.root / "config" / "display_state.json"
+        self.state_path = self.root / "config" / "app_state.json"
         self.state = self._load_state()
         self.display_index = self._normalized_display_index(int(self.state.get("last_display", 0)))
 
         pygame.init()
-        init_page_sounds()
         self.screen = self._apply_display_mode(self.display_index)
-        pygame.display.set_caption("360 Experience MVP")
+        pygame.display.set_caption("JerLauncher")
         self.clock = pygame.time.Clock()
-        self.target_fps = int(self.theme["motion"]["target_fps"])
+        self.target_fps = 60
 
         self.scene_manager = SceneManager()
         self.input_manager = InputManager()
         self.input_manager.initialize()
         self.launcher = Launcher()
-        self._dashboard: DashboardScene | None = None
 
-        boot_video = self.project_root / "assets" / "xbox360metro.mp4"
+        self._active_theme: ThemePackage | None = None
+        self._dashboard = None
+        self._theme_cache_root = self.project_root / "config" / "themes"
+
+        if not self._try_boot_saved_theme():
+            self._enter_core()
+
+    def _try_boot_saved_theme(self) -> bool:
+        saved = self.state.get("last_theme_zip")
+        if not saved:
+            return False
+        zip_path = Path(str(saved))
+        try:
+            theme = load_theme_zip(zip_path, cache_root=self._theme_cache_root)
+        except ThemeLoadError:
+            return False
+        return self._activate_theme(theme)
+
+    def _return_to_core(self) -> None:
+        self._active_theme = None
+        self.state.pop("last_theme_zip", None)
+        self._save_state()
+        self._enter_core()
+
+    def _enter_core(self) -> None:
+        set_active(None)
+        self._dashboard = None
         self.scene_manager.set_scene(
-            BootScene(
-                self.theme,
-                boot_video,
-                self._enter_dashboard,
-                screen=self.screen,
+            CoreScene(
+                launcher=self.launcher,
+                on_choose_theme=self._open_theme_picker,
+                on_quit=self._request_quit,
             )
         )
-        boot_scene = self.scene_manager.current_scene
-        if boot_scene is not None:
-            boot_scene.render(self.screen)
-        pygame.display.flip()
 
-    def _enter_dashboard(self) -> None:
-        if self._dashboard is None:
-            self._dashboard = DashboardScene(
-                self.theme,
-                self.games,
-                self.launcher,
-                on_switch_display=self._cycle_display,
-            )
+    def _request_quit(self) -> None:
+        self._quit_requested = True
+
+    def _open_theme_picker(self) -> None:
+        themes_dir = self.project_root / "themes"
+        initial = themes_dir if themes_dir.is_dir() else self.project_root
+        zip_path = pick_theme_zip(initial_dir=initial)
+        if zip_path is None:
+            return
+        try:
+            theme = load_theme_zip(zip_path, cache_root=self._theme_cache_root)
+        except ThemeLoadError as exc:
+            scene = self.scene_manager.current_scene
+            if scene is not None and hasattr(scene, "status_text"):
+                scene.status_text = str(exc)
+                if hasattr(scene, "_status_timer"):
+                    scene._status_timer = 4.0
+            return
+
+        self.state["last_theme_zip"] = str(zip_path.resolve())
+        self._save_state()
+        self._activate_theme(theme)
+
+    def _activate_theme(self, theme: ThemePackage) -> bool:
+        try:
+            module = load_theme_module(theme)
+        except RuntimeError as exc:
+            scene = self.scene_manager.current_scene
+            if scene is not None and hasattr(scene, "status_text"):
+                scene.status_text = str(exc)
+                if hasattr(scene, "_status_timer"):
+                    scene._status_timer = 4.0
+            return False
+
+        self._active_theme = theme
+        module.activate(theme)
+        boot_scene = module.create_boot_scene(
+            theme,
+            screen=self.screen,
+            on_finished=self._enter_themed_dashboard,
+        )
+        self.scene_manager.set_scene(boot_scene)
+        boot_scene.render(self.screen)
+        pygame.display.flip()
+        return True
+
+    def _enter_themed_dashboard(self) -> None:
+        if self._active_theme is None:
+            self._enter_core()
+            return
+        module = load_theme_module(self._active_theme)
+        self._dashboard = module.create_dashboard_scene(
+            self._active_theme,
+            self.games,
+            self.launcher,
+            on_switch_display=self._cycle_display,
+            on_back_to_core=self._return_to_core,
+            on_choose_theme=self._open_theme_picker,
+        )
         self.scene_manager.set_scene(self._dashboard)
 
     def run(self) -> None:
+        self._quit_requested = False
         running = True
-        while running:
+        while running and not self._quit_requested:
             dt = self.clock.tick(self.target_fps) / 1000.0
             self.input_manager.update(dt)
 
             scene_for_input = self.scene_manager.current_scene
             if scene_for_input is not None:
                 for action in self.input_manager.consume_synthetic_actions():
+                    if action == "EXIT_TO_DESKTOP":
+                        running = False
+                        break
                     scene_for_input.handle_action(action)
+
+            if not running:
+                break
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -98,7 +176,12 @@ class MetroApp:
                 if event.type == pygame.KEYDOWN and scene.handle_keydown(event):
                     continue
                 for action in self.input_manager.actions_from_event(event):
+                    if action == "EXIT_TO_DESKTOP":
+                        running = False
+                        break
                     scene.handle_action(action)
+                if not running:
+                    break
 
             scene = self.scene_manager.current_scene
             if scene is not None:
@@ -138,7 +221,7 @@ class MetroApp:
     @staticmethod
     def _get_display_count() -> int:
         if os.name == "nt":
-            monitor_bounds = MetroApp._get_monitor_bounds_windows()
+            monitor_bounds = GameLauncherApp._get_monitor_bounds_windows()
             if monitor_bounds:
                 return len(monitor_bounds)
         count_from_num = 0
@@ -180,7 +263,6 @@ class MetroApp:
             scene._status_timer = 2.0
 
     def _apply_display_mode(self, display_index: int) -> pygame.Surface:
-        # SDL checks this hint for target display on Windows.
         os.environ["SDL_VIDEO_FULLSCREEN_DISPLAY"] = str(display_index)
         monitor_bounds = self._get_monitor_bounds_windows()
         desktop_sizes = pygame.display.get_desktop_sizes()
@@ -198,10 +280,8 @@ class MetroApp:
             target_width = right - left
             target_height = bottom - top
 
-        # Create borderless fullscreen-style window first.
         screen = pygame.display.set_mode((target_width, target_height), pygame.NOFRAME)
 
-        # Then force exact monitor coordinates using native window APIs.
         if monitor_bounds and safe_index < len(monitor_bounds):
             self._position_window_windows(left, top, target_width, target_height)
 

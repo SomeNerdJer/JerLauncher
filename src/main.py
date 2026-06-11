@@ -1,8 +1,8 @@
-from core.app import MetroApp
+from core.app import GameLauncherApp
 
 
 def main() -> None:
-    app = MetroApp()
+    app = GameLauncherApp()
     app.run()
 
 
