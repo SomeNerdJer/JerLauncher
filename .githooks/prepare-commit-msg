@@ -1,0 +1,8 @@
+#!/bin/sh
+# Keep commits attributed to the repo owner; strip Cursor agent trailers.
+MSG_FILE="$1"
+[ -f "$MSG_FILE" ] || exit 0
+grep -v 'cursoragent@cursor\.com' "$MSG_FILE" \
+  | grep -v '^Co-authored-by: Cursor ' \
+  | grep -v '^Made-with: Cursor' \
+  > "$MSG_FILE.tmp" && mv "$MSG_FILE.tmp" "$MSG_FILE"
